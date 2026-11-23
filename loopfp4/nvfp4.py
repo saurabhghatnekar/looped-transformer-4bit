@@ -67,7 +67,7 @@ def _from_blocks(xb: torch.Tensor, pad: int) -> torch.Tensor:
     return x[..., : x.shape[-1] - pad] if pad else x
 
 
-def nvfp4_scales(xb: torch.Tensor, outer: str, target: float, headroom: float):
+def nvfp4_scales(xb: torch.Tensor, outer: str, target: float, e4m3_max: float = E4M3_MAX):
     """Return (s_block [..., nb, 1], s_global) for blocked input xb [..., nb, 16]."""
     block_amax = xb.abs().amax(dim=-1, keepdim=True)
     if outer == "tensor":
@@ -78,7 +78,7 @@ def nvfp4_scales(xb: torch.Tensor, outer: str, target: float, headroom: float):
         g_amax = block_amax.amax(dim=tuple(range(1, block_amax.dim())), keepdim=True)
     else:
         raise ValueError(outer)
-    s_global = (g_amax / (E4M3_MAX * headroom)).clamp(min=_TINY)
+    s_global = (g_amax / (e4m3_max * FP4_MAX)).clamp(min=_TINY)
     s_block = round_e4m3(block_amax / target / s_global)
     return s_block, s_global
 
@@ -90,11 +90,12 @@ def nvfp4_quantize(x: torch.Tensor, outer: str = "tensor", four_over_six: bool =
     whichever has lower squared error ("Four Over Six"). Used for activations.
     """
     xb, pad = _to_blocks(x, NVFP4_BLOCK)
-    # With 4/6 the block scale can be 1.5x larger, so leave room for it in the outer scale.
-    headroom = 4.0 if four_over_six else FP4_MAX
+    # 256 instead of 448 as the target-6 block-scale ceiling leaves exact E4M3 room (256 * 1.5 = 384)
+    # for mapping a peak block to 4 without clipping target-6 (matches TE's nvfp4_e4m3_max=256).
+    e4m3_max = 256.0 if four_over_six else E4M3_MAX
 
     def quant(target: float) -> torch.Tensor:
-        s_block, s_global = nvfp4_scales(xb, outer, target, headroom)
+        s_block, s_global = nvfp4_scales(xb, outer, target, e4m3_max)
         scale = s_block * s_global
         safe = torch.where(scale > 0, scale, torch.ones_like(scale))
         return round_e2m1(xb / safe) * scale  # a block whose scale underflows flushes to zero
@@ -231,10 +232,10 @@ _E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
 def nvfp4_pack(w: torch.Tensor) -> dict:
-    """Pack a 2-D weight into NVFP4: uint8 nibble pairs, float32-held E4M3 block scales, FP32 global."""
+    """Pack a 2-D weight into NVFP4: uint8 nibble pairs, float8_e4m3fn block scales, FP32 global."""
     w = w.detach().float().cpu()
     xb, pad = _to_blocks(w, NVFP4_BLOCK)
-    s_block, s_global = nvfp4_scales(xb, "tensor", FP4_MAX, FP4_MAX)
+    s_block, s_global = nvfp4_scales(xb, "tensor", FP4_MAX)
     scale = s_block * s_global
     safe = torch.where(scale > 0, scale, torch.ones_like(scale))
     q = round_e2m1(xb / safe)
@@ -245,7 +246,7 @@ def nvfp4_pack(w: torch.Tensor) -> dict:
     packed = codes[0::2] | (codes[1::2] << 4)
     return {
         "codes": packed,
-        "s_block": s_block.squeeze(-1).contiguous(),  # E4M3-representable; 1 byte each on disk
+        "s_block": s_block.squeeze(-1).to(torch.float8_e4m3fn).contiguous(),  # 1 byte per 16 values
         "s_global": s_global.reshape(1),
         "shape": torch.tensor(w.shape),
     }
@@ -258,5 +259,6 @@ def nvfp4_unpack(p: dict) -> torch.Tensor:
     codes = torch.stack([p["codes"] & 0xF, p["codes"] >> 4], dim=1).reshape(-1)[:n].long()
     mag = _E2M1_GRID[codes & 0x7]
     q = torch.where((codes >> 3) == 1, -mag, mag).reshape(shape[0], -1, NVFP4_BLOCK)
-    w = q * (p["s_block"].unsqueeze(-1) * p["s_global"])
+    s_block = p["s_block" if "s_block" in p else "s_block_e4m3"].float()
+    w = q * (s_block.unsqueeze(-1) * p["s_global"].float())
     return w.reshape(shape[0], padded)[:, : shape[-1]]

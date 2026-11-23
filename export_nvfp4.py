@@ -21,8 +21,7 @@ from loopfp4.nvfp4 import QLinear, nvfp4_pack, nvfp4_unpack, quantize_expert_wei
 def pack(w, want):
     p = nvfp4_pack(w)
     assert torch.equal(nvfp4_unpack(p), want), "packed weights do not reproduce the training weights"
-    p["s_block_e4m3"] = p.pop("s_block")  # held as float32 here; one byte each in a real container
-    return p, p["codes"].numel() + p["s_block_e4m3"].numel() + 4
+    return p, p["codes"].numel() + p["s_block"].numel() * p["s_block"].element_size() + 4
 
 
 def main(src, dst):

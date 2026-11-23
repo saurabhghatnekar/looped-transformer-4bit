@@ -67,7 +67,8 @@ def main():
     if args.experts and ink:
         cfg.n_routed_experts = args.experts
     s = size_inkling(cfg) if ink else size_dense(cfg)
-    flops_per_token = 6 * s["applied"]                  # 2 forward + 4 backward per weight applied
+    flops_mult = 8 if cfg.grad_checkpoint else 6        # 2 fwd (+ 2 recompute if checkpointed) + 4 bwd
+    flops_per_token = flops_mult * s["applied"]
     state_gb = s["stored"] * 16 / 1e9
 
     print(f"preset {args.preset}: {s['desc']}")
@@ -75,7 +76,8 @@ def main():
     print(f"  active per token         {s['active'] / 1e9:8.3f} B   (one pass; what the model card calls 'active')")
     print(f"  layer applications/token {s['applications']:8d}   (non-looped would be {s['layers']})")
     print(f"  weights applied/token    {s['applied'] / 1e9:8.3f} B   (looped layers counted once per pass)")
-    print(f"  training FLOPs/token     {flops_per_token:8.2e}")
+    ckpt_note = "  (includes activation-checkpoint recompute)" if cfg.grad_checkpoint else ""
+    print(f"  training FLOPs/token     {flops_per_token:8.2e}{ckpt_note}")
     print(f"  deployed checkpoint      {s['ckpt'] / 1e9:8.2f} GB  ({s['formats']})")
     print(f"  training weight state    {state_gb:8.1f} GB  (FP32 weights + grads + two Adam moments), before activations")
     if state_gb > 0.8 * args.gpu_gb:

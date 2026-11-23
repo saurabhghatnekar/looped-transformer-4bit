@@ -18,9 +18,16 @@ class ShardData:
         if not files:
             raise FileNotFoundError(f"no {split}_*.bin shards in {data_dir}; run prepare_data.py first")
         meta_path = os.path.join(data_dir, "meta.json")
-        self.meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {"dtype": "uint16"}
-        self.shards = [np.memmap(f, dtype=np.dtype(self.meta["dtype"]), mode="r") for f in files]
-        self.shards = [s for s in self.shards if len(s) > block_size + 1]
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                self.meta = json.load(f)
+        else:
+            self.meta = {"dtype": "uint16"}
+        dtype = np.dtype(self.meta["dtype"])
+        nonempty = [f for f in files if os.path.getsize(f) >= dtype.itemsize * (block_size + 2)]
+        if not nonempty:
+            raise ValueError(f"all {split}_*.bin shards in {data_dir} are <= block_size + 1 ({block_size + 1}) tokens")
+        self.shards = [np.memmap(f, dtype=dtype, mode="r") for f in nonempty]
         sizes = np.array([len(s) for s in self.shards], dtype=np.float64)
         self.probs = sizes / sizes.sum()
         self.total_tokens = int(sizes.sum())

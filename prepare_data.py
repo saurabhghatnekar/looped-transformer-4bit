@@ -17,6 +17,7 @@ Writes meta.json (token dtype, vocabulary size) next to the shards.
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 
@@ -34,9 +35,13 @@ def make_encoder(name):
         return enc.encode_ordinary_batch, enc.eot_token, enc.n_vocab
     from tokenizers import Tokenizer  # hf:<repo>
     tok = Tokenizer.from_pretrained(name[3:])
-    sep = tok.token_to_id("<|endoftext|>")
+    sep = next((tok.token_to_id(s) for s in ("<|endoftext|>", "<|end_of_text|>", "<|eos|>", "</s>", "<eos>")
+                if tok.token_to_id(s) is not None), None)
+    if sep is None:
+        print("warning: no standard EOS token found in tokenizer; falling back to id 0", flush=True)
+        sep = 0
     encode = lambda texts: [e.ids for e in tok.encode_batch(texts, add_special_tokens=False)]
-    return encode, (0 if sep is None else sep), tok.get_vocab_size()
+    return encode, sep, tok.get_vocab_size()
 
 
 def write_shard(out, split, n, tokens):
@@ -67,19 +72,29 @@ def from_hf(args):
     encode = lambda texts: [[args.sep] + list(t) for t in args.encode(texts)]
 
     buf, total, n_shard, wrote_val = [], 0, 0, False
+    val_size = min(args.shard_tokens, max(int(args.max_tokens * args.val_frac), 1)) if args.max_tokens else args.shard_tokens
     for batch in ds.iter(batch_size=1024):
         for toks in encode(batch[args.text_field]):
             buf.extend(toks)
-        while len(buf) >= args.shard_tokens:
-            chunk, buf = buf[: args.shard_tokens], buf[args.shard_tokens :]
-            if not wrote_val:  # first shard is held out for validation
-                write_shard(args.out, "val", 0, chunk)
+        while True:
+            if not wrote_val:
+                if len(buf) < val_size:
+                    break
+                write_shard(args.out, "val", 0, buf[:val_size])
+                buf = buf[val_size:]
                 wrote_val = True
-            else:
-                write_shard(args.out, "train", n_shard, chunk)
-                n_shard += 1
-                total += len(chunk)
-        if args.max_tokens and total >= args.max_tokens:
+                continue
+            target = min(args.shard_tokens, args.max_tokens - total) if args.max_tokens else args.shard_tokens
+            if target <= 0 or len(buf) < target:
+                break
+            write_shard(args.out, "train", n_shard, buf[:target])
+            buf = buf[target:]
+            n_shard += 1
+            total += target
+        if args.max_tokens and wrote_val and total + len(buf) >= args.max_tokens:
+            need = max(0, args.max_tokens - total)
+            if need and buf:
+                write_shard(args.out, "train", n_shard, buf[:need])
             return
     if buf:
         write_shard(args.out, "train" if wrote_val else "val", n_shard, buf)
@@ -102,3 +117,7 @@ if __name__ == "__main__":
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump({"dtype": np.dtype(DTYPE).name, "vocab_size": vocab, "tokenizer": args.tokenizer}, f)
     (from_hf if args.source.startswith("hf:") else from_file)(args)
+    if args.source.startswith("hf:"):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)

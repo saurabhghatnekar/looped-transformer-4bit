@@ -192,10 +192,16 @@ class LoopedTransformer(nn.Module):
 
     def _run(self, blk, x, cos, sin):
         if self.cfg.grad_checkpoint and self.training:
-            return checkpoint(blk, x, cos, sin, use_reentrant=False)
+            ckpt_fn = checkpoint
+            if self.cfg.backend == "te":
+                try:
+                    from transformer_engine.pytorch.distributed import checkpoint as ckpt_fn
+                except ImportError:
+                    pass
+            return ckpt_fn(blk, x, cos, sin, use_reentrant=False)
         return blk(x, cos, sin)
 
-    def forward(self, idx, targets=None, n_loops=None):
+    def forward(self, idx, targets=None, n_loops=None, return_logits: bool = True):
         cfg = self.cfg
         n_loops = n_loops or cfg.n_loops
         T = idx.shape[1]
@@ -204,6 +210,8 @@ class LoopedTransformer(nn.Module):
         cos, sin = self._rope
 
         x = self.emb(idx)
+        if torch.is_autocast_enabled(idx.device.type):
+            x = x.to(torch.get_autocast_dtype(idx.device.type))
         for blk in self.prelude:
             x = self._run(blk, x, cos, sin)
 
@@ -222,10 +230,29 @@ class LoopedTransformer(nn.Module):
             m._wq = None
         if n_loops == 1:  # keep the loop plumbing in the graph so DDP sees a gradient for it
             x = x + 0.0 * (self.g_msg.sum() + self.msg_norm.weight.sum())
+        if cfg.n_loop == 1:
+            x = x + 0.0 * self.g_pre.sum()
 
         for blk in self.coda:
             x = self._run(blk, x, cos, sin)
-        logits = self.head(self.norm_f(x))
+        hidden = self.norm_f(x)
+        if targets is not None and not return_logits:
+            h_flat = hidden.reshape(-1, hidden.size(-1))
+            t_flat = targets.reshape(-1)
+            chunk = 1024
+
+            def _ce_chunk(h_c, t_c):
+                return F.cross_entropy(self.head(h_c).float(), t_c, reduction="sum")
+
+            total = h_flat.new_zeros((), dtype=torch.float32)
+            for s in range(0, h_flat.size(0), chunk):
+                h_c, t_c = h_flat[s : s + chunk], t_flat[s : s + chunk]
+                if self.training and h_c.requires_grad:
+                    total = total + checkpoint(_ce_chunk, h_c, t_c, use_reentrant=False)
+                else:
+                    total = total + _ce_chunk(h_c, t_c)
+            return None, total / t_flat.numel()
+        logits = self.head(hidden)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), targets.reshape(-1))
@@ -235,6 +262,9 @@ class LoopedTransformer(nn.Module):
     def generate(self, idx, max_new_tokens: int, temperature: float = 0.8, top_k: int = 50, n_loops=None):
         for _ in range(max_new_tokens):
             logits, _ = self(idx[:, -self.cfg.block_size:], n_loops=n_loops)
+            if temperature == 0:
+                idx = torch.cat([idx, logits[:, -1:].argmax(dim=-1)], dim=1)
+                continue
             logits = logits[:, -1].float() / temperature
             if top_k:
                 kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]

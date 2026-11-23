@@ -335,6 +335,50 @@ def test_native_recipes_by_layer():
     assert all(enabled for enabled, _ in calls) and len(calls) == 8 + 2 * 4      # 8 layers, 4 looped twice more
 
 
+def test_bfloat16_autocast_and_export_roundtrip():
+    import tempfile
+    import export_nvfp4
+    from loopfp4 import get_state, load_checkpoint
+
+    model = randomise(Inkling(InklingConfig(**TINY, grad_checkpoint=True))).train()
+    seen = []
+    orig = model.layers[0].mlp.forward
+    model.layers[0].mlp.forward = lambda inp: (seen.append(inp.dtype), orig(inp))[1]
+    idx = torch.randint(0, 64, (2, 17))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        _, loss = model(idx[:, :-1], idx[:, 1:])
+    loss.backward()
+    assert seen == [torch.bfloat16, torch.bfloat16]  # forward + checkpoint recomputation
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+    model.layers[0].mlp.forward = orig
+    model.eval()
+    with tempfile.TemporaryDirectory() as tmp:
+        ck_path, exp_path = os.path.join(tmp, "ckpt.pt"), os.path.join(tmp, "nvfp4.pt")
+        torch.save({"model": get_state(model), "config": model.config_dict(), "arch": "inkling"}, ck_path)
+        export_nvfp4.main(ck_path, exp_path)
+        unpacked, _ = load_checkpoint(exp_path)
+        unpacked.eval()
+        assert torch.equal(quantize_expert_weight(model.layers[0].mlp.experts.gate_up_proj, "nvfp4"),
+                           unpacked.layers[0].mlp.experts.gate_up_proj)
+        sd_bf16 = {k: (v.bfloat16().float() if v.is_floating_point() and not (".mlp.experts." in k and any(f"layers.{i}." in k for i in range(6))) else v)
+                   for k, v in model.state_dict().items()}
+        with torch.no_grad():
+            raw_logits = model(idx[:, :-1])[0]
+            unpacked_logits = unpacked(idx[:, :-1])[0]
+            assert torch.allclose(raw_logits, unpacked_logits, atol=1e-1)  # BF16 rounding noise on non-FP4 weights
+            model.load_state_dict(sd_bf16)
+            assert torch.allclose(model(idx[:, :-1])[0], unpacked_logits, atol=1e-5)  # zero packing error
+        broken = torch.load(exp_path, map_location="cpu")
+        del broken["tensors"]["lm_head.weight"]
+        torch.save(broken, exp_path)
+        try:
+            load_checkpoint(exp_path)
+            assert False, "expected missing weight in exported file to fail"
+        except RuntimeError:
+            pass
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

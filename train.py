@@ -50,6 +50,7 @@ def parse():
                     help="with --backend te on Inkling presets. tml (default): NVFP4 forward, MXFP8 backward, "
                          "Four-Over-Six, as published. rowscaled: the same without Four-Over-Six, using only "
                          "a factory Transformer Engine ships. nvidia: its default NVFP4 recipe.")
+    ap.add_argument("--te-align", type=int, help="m_splits row alignment for TE GroupedLinear (1 = unpadded)")
     # dense-* presets only
     ap.add_argument("--quant-scope", choices=["all", "mlp"])
     ap.add_argument("--block-size", type=int)
@@ -100,21 +101,26 @@ def main():
         torch.distributed.init_process_group(backend="nccl")
     torch.manual_seed(args.seed + rank)
 
-    init = torch.load(args.init, map_location="cpu") if args.init else None
-    if init:
-        cfg = InklingConfig(**init["config"]) if init.get("arch") == "inkling" else Config(**init["config"])
+    ckpt_path = os.path.join(args.out, "ckpt.pt")
+    resuming = args.resume and os.path.exists(ckpt_path)
+    ck = torch.load(ckpt_path if resuming else args.init, map_location="cpu") if (resuming or args.init) else None
+    if ck is not None:
+        cfg = InklingConfig(**ck["config"]) if ck.get("arch") == "inkling" else Config(**ck["config"])
     else:
         cfg = dataclasses.replace(PRESETS[args.preset])
     ink = isinstance(cfg, InklingConfig)
-    train = ShardData(args.data, "train", 1, 1, "cpu")  # opened early for its vocabulary size
-    vocab = args.vocab_size or (None if init else train.meta.get("vocab_size"))
+    train_probe = ShardData(args.data, "train", 1, 1, "cpu")  # opened early for its vocabulary size
+    vocab = args.vocab_size or (None if ck is not None else train_probe.meta.get("vocab_size"))
+    del train_probe
     overrides = {"quant": args.quant, "block_size": args.block_size, "grad_checkpoint": args.grad_checkpoint,
-                 "vocab_size": vocab, "backend": args.backend or "sim"}  # the backend is chosen per run
+                 "backend": args.backend or "sim"}  # the backend is chosen per run
     if ink:
-        overrides.update(loop_num_passes=args.loops, n_routed_experts=args.experts, backward=args.backward,
-                         unpadded_vocab_size=vocab, te_recipe=args.te_recipe)
+        padded_vocab = args.vocab_size or (cfg.vocab_size if vocab == cfg.unpadded_vocab_size else vocab)
+        overrides.update(vocab_size=padded_vocab, unpadded_vocab_size=vocab, loop_num_passes=args.loops,
+                         n_routed_experts=args.experts, backward=args.backward, te_recipe=args.te_recipe,
+                         te_align=args.te_align)
     else:
-        overrides.update(n_loops=args.loops, quant_scope=args.quant_scope)
+        overrides.update(vocab_size=vocab, n_loops=args.loops, quant_scope=args.quant_scope)
     if overrides["backend"] == "te" and not torch.cuda.is_available():
         raise SystemExit("--backend te needs a Blackwell GPU and NVIDIA Transformer Engine; use --backend sim here")
     for field, val in overrides.items():
@@ -127,8 +133,9 @@ def main():
         loop_choices = ([int(a) for a, _ in pairs], [float(b) for _, b in pairs])
 
     model = build(cfg)
-    if init:
-        set_state(model, init["model"])
+    if ck is not None:
+        set_state(model, ck["model"])
+        del ck["model"]  # free CPU state_dict copy before moving model + optimizer to device
     model = model.to(device)
     raw = model
     if master:
@@ -140,8 +147,8 @@ def main():
         print(f"device={device} world={world} params={raw.num_params() / 1e6:.2f}M "
               f"applications={cfg.applications()} quant={cfg.quant} {detail}", flush=True)
 
-    # Weight decay on matrices only: never on norm gains, learned scales or attention-residual queries.
-    skip = ("scale", "query", "norm", "static_weight")
+    # Weight decay on matrices only: never on norm gains, learned scales, 1D depthwise convs or residual queries.
+    skip = ("scale", "query", "norm", "static_weight", "conv1d")
     named = list(raw.named_parameters())
     decay = [p for n, p in named if p.dim() >= 2 and not any(k in n for k in skip)]
     no_decay = [p for n, p in named if not (p.dim() >= 2 and not any(k in n for k in skip))]
@@ -151,22 +158,28 @@ def main():
     )
 
     step = 0
-    ckpt_path = os.path.join(args.out, "ckpt.pt")
-    if args.resume and os.path.exists(ckpt_path):
-        ck = torch.load(ckpt_path, map_location=device)
-        set_state(raw, ck["model"])
+    loop_rng = torch.Generator().manual_seed(args.seed)  # same stream on every rank
+    train = ShardData(args.data, "train", cfg.block_size, args.batch_size, device, seed=args.seed * 1000 + rank)
+    val = ShardData(args.data, "val", cfg.block_size, args.batch_size, device, seed=12345)
+    if resuming:
         opt.load_state_dict(ck["opt"])
         step = ck["step"]
+        rngs = ck.get("data_rngs")
+        if rngs and rank < len(rngs):
+            train.rng.bit_generator.state = rngs[rank]
+        else:
+            train.rng.bit_generator.advance(step * args.grad_accum * (args.batch_size + 2))
+        if "loop_rng" in ck:
+            loop_rng.set_state(ck["loop_rng"].cpu())
         if master:
             print(f"resumed from step {step}", flush=True)
+    is_fresh_init = bool(args.init and not resuming)
+    del ck
 
     if args.compile:
         model = torch.compile(model)
     if ddp:
-        model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
-
-    train = ShardData(args.data, "train", cfg.block_size, args.batch_size, device, seed=args.seed * 1000 + rank)
-    val = ShardData(args.data, "val", cfg.block_size, args.batch_size, device, seed=12345)
+        model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], broadcast_buffers=False)
 
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if device.startswith("cuda") else contextlib.nullcontext()
     if not ink and cfg.backend == "te" and cfg.quant == "nvfp4":
@@ -183,22 +196,24 @@ def main():
         for _ in range(args.eval_batches):
             x, y = val.batch()
             with amp, fp4():
-                _, loss = raw(x, y, n_loops=n_loops)
+                _, loss = raw(x, y, n_loops=n_loops, return_logits=False)
             tot += loss.item()
         raw.train()
         return tot / args.eval_batches
 
-    def save():
+    def save(data_rngs):
         torch.save({"model": get_state(raw), "opt": opt.state_dict(), "step": step,
-                    "arch": "inkling" if ink else "dense", "config": raw.config_dict(), "args": vars(args)},
+                    "arch": "inkling" if ink else "dense", "config": raw.config_dict(), "args": vars(args),
+                    "data_rngs": data_rngs, "loop_rng": loop_rng.get_state()},
                    ckpt_path)
 
     log = open(os.path.join(args.out, "log.jsonl"), "a") if master else None
-    if master and init:  # where the loaded weights start from, e.g. the loss right after pruning
+    if master and is_fresh_init:  # where the loaded weights start from, e.g. the loss right after pruning
         rec = {"step": 0, "val_loss": round(evaluate(), 4), "init": args.init}
         print(json.dumps(rec), flush=True)
         log.write(json.dumps(rec) + "\n"); log.flush()
-    loop_rng = torch.Generator().manual_seed(args.seed)  # same stream on every rank
+    if ddp and is_fresh_init:
+        torch.distributed.barrier()
     tokens_per_step = args.batch_size * cfg.block_size * args.grad_accum * world
     t0, last = time.time(), step
     model.train()
@@ -210,10 +225,11 @@ def main():
         if loop_choices:
             n_loops = loop_choices[0][torch.multinomial(torch.tensor(loop_choices[1]), 1, generator=loop_rng).item()]
 
-        for _ in range(args.grad_accum):
+        for micro in range(args.grad_accum):
             x, y = train.batch()
-            with amp, fp4():
-                _, loss = model(x, y, n_loops=n_loops)
+            sync_ctx = model.no_sync() if (ddp and micro < args.grad_accum - 1) else contextlib.nullcontext()
+            with sync_ctx, amp, fp4():
+                _, loss = model(x, y, n_loops=n_loops, return_logits=False)
             (loss / args.grad_accum).backward()
         if args.clip:
             torch.nn.utils.clip_grad_norm_(raw.parameters(), args.clip)
@@ -229,7 +245,8 @@ def main():
                    "tok_per_s": round(tokens_per_step * (step - last) / dt)}
             if ink:  # gate: how far the loop message gates have opened. load: busiest expert's
                 # share of tokens relative to an even split (1.0 = perfectly balanced), worst layer.
-                share = torch.stack([m.usage for m in raw.moe_blocks()])
+                raw_u = torch.stack([m.usage for m in raw.moe_blocks()])
+                share = raw_u / raw_u.sum(dim=1, keepdim=True).clamp(min=1e-12)
                 rec["gate"] = round(raw.loop_gate_strength(), 5)
                 rec["load_max"] = round((share.max(dim=1).values * share.shape[1]).max().item(), 2)
                 rec["idle_experts"] = int((share * share.shape[1] < 0.1).sum().item())
@@ -239,15 +256,24 @@ def main():
             t0, last = time.time(), step
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n"); log.flush()
-        if master and (step % args.eval_every == 0 or step == args.steps):
-            rec = {"step": step, "val_loss": round(evaluate(), 4)}
-            if passes > 1:
-                rec["val_loss_1_loop"] = round(evaluate(n_loops=1), 4)
-            print(json.dumps(rec), flush=True)
-            log.write(json.dumps(rec) + "\n"); log.flush()
+        if step % args.eval_every == 0 or step == args.steps:
+            if master:
+                rec = {"step": step, "val_loss": round(evaluate(), 4)}
+                if passes > 1:
+                    rec["val_loss_1_loop"] = round(evaluate(n_loops=1), 4)
+                print(json.dumps(rec), flush=True)
+                log.write(json.dumps(rec) + "\n"); log.flush()
+            if ddp:
+                torch.distributed.barrier()
             t0, last = time.time(), step
-        if master and (step % args.save_every == 0 or step == args.steps):
-            save()
+        if step % args.save_every == 0 or step == args.steps:
+            data_rngs = [None] * world if ddp else [train.rng.bit_generator.state]
+            if ddp:
+                torch.distributed.all_gather_object(data_rngs, train.rng.bit_generator.state)
+            if master:
+                save(data_rngs)
+            if ddp:
+                torch.distributed.barrier()
 
     if ddp:
         torch.distributed.destroy_process_group()

@@ -50,7 +50,7 @@ def test_nvfp4_structure():
         assert q.shape == x.shape
         xb, _ = _to_blocks(x, 16)
         qb, _ = _to_blocks(q, 16)
-        s_block, s_global = nvfp4_scales(xb, outer, 6.0, 6.0)
+        s_block, s_global = nvfp4_scales(xb, outer, 6.0)
         scale = s_block * s_global
         ratio = qb / torch.where(scale > 0, scale, torch.ones_like(scale))
         assert (ratio.abs().unsqueeze(-1) - GRID).abs().min(-1).values.max() < 1e-4  # every value is grid * scale
@@ -68,6 +68,8 @@ def test_four_over_six_never_worse():
           f"mxfp8 {(mxfp8_quantize(x) - x).square().mean().sqrt() / x.std():.4f}")
     assert e46 < e6
     assert (mxfp8_quantize(x) - x).square().mean() < e46 / 5  # 3 mantissa bits vs 1
+    exact = torch.tensor([[6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.5] + [0.0] * 9])
+    assert torch.equal(nvfp4_quantize(exact, "row", four_over_six=True), exact)  # peak block not clipped
 
 
 def test_ste_gradients():
@@ -86,6 +88,7 @@ def test_pack_roundtrip():
     w = torch.randn(48, 200) * 0.02
     p = nvfp4_pack(w)
     assert p["codes"].dtype == torch.uint8 and p["codes"].numel() == 48 * 208 // 2
+    assert p["s_block"].dtype == torch.float8_e4m3fn and p["s_block"].element_size() == 1
     assert torch.equal(nvfp4_unpack(p), nvfp4_quantize(w, "tensor"))  # deployed weights == trained-against weights
 
 

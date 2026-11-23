@@ -20,6 +20,7 @@ vision tower, no multi-token-prediction head, and the expert GEMMs are batched a
 and can run quantized (NVFP4, or MXFP8 in the last layers) with MXFP8 backward GEMMs.
 """
 
+import inspect as _inspect
 import math
 from dataclasses import asdict, dataclass, fields
 
@@ -27,6 +28,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    _FLEX_USE_AUX = "return_aux" in _inspect.signature(flex_attention).parameters
+    if _FLEX_USE_AUX:
+        from torch.nn.attention.flex_attention import AuxRequest
+    else:
+        AuxRequest = None
+except ImportError:
+    flex_attention = create_block_mask = AuxRequest = None
+    _FLEX_USE_AUX = False
 
 from .nvfp4 import qgemm, quantize_act, quantize_expert_weight
 
@@ -79,6 +91,8 @@ class InklingConfig:
     # GEMMs on Blackwell. A runtime choice: checkpoints are the same for both.
     backend: str = "sim"
     te_recipe: str = "tml"                   # "tml" | "rowscaled" | "nvidia", see te_recipe() below
+    te_align: int = 32                       # m_splits row alignment for GroupedLinear (TE MXFP8 requires % 32 == 0, NVFP4 % 16 == 0)
+    use_flex_attn: bool = True               # use fused CUDA FlexAttention when seqlen >= 128
 
     def is_global(self, i: int) -> bool:
         return (i + 1) % self.global_every == 0
@@ -106,7 +120,7 @@ class InklingConfig:
                  loop_num_passes=loop.get("num_passes", 3), loop_gate_rank=loop.get("gate_rank", 64))
         if "local_layer_ids" in t:
             glob = sorted(set(range(t["num_hidden_layers"])) - set(t["local_layer_ids"]))
-            t["global_every"] = glob[0] + 1
+            t["global_every"] = glob[0] + 1 if glob else t["num_hidden_layers"] + 1
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in t.items() if k in known}, **overrides)
 
@@ -202,14 +216,69 @@ class RelativePositionBias(nn.Module):
         self.linear = nn.Linear(cfg.hidden_size, heads * cfg.d_rel, bias=False)
         self.norm = ScaledL2Clip(cfg, heads, cfg.d_rel, cfg.rel_l2_clip_threshold, log_scaling)
         self.proj = nn.Parameter(torch.empty(cfg.d_rel, rel_extent))
+        nn.init.normal_(self.proj, mean=0.0, std=cfg.initializer_range)
 
-    def forward(self, h, dist, pos):  # h [B, T, H], dist [T, T]
+    def logits(self, h, pos):  # [B, heads, T, extent]
         B, T, _ = h.shape
         rel = self.norm(self.linear(h).view(B, T, self.heads, -1), pos)
-        rel_logits = (rel.float() @ self.proj.float()).transpose(1, 2)              # [B, heads, T, extent]
+        return (rel.float() @ self.proj.float()).transpose(1, 2)
+
+    def forward(self, h, dist, pos):  # h [B, T, H], dist [T, T]
+        B = h.shape[0]
+        rel_logits = self.logits(h, pos)
         index = dist.clamp(0, self.rel_extent - 1).expand(B, self.heads, -1, -1)
         bias = rel_logits.gather(-1, index)
         return bias.masked_fill((dist < 0) | (dist >= self.rel_extent), 0.0)
+
+
+_BLOCK_MASK_CACHE: dict[tuple[int, int | None, torch.device], object] = {}
+
+
+@torch.compiler.disable
+def _get_block_mask(T: int, window: int | None, device: torch.device):
+    key = (T, window, device)
+    bm = _BLOCK_MASK_CACHE.get(key)
+    if bm is None:
+        if window is None:
+            def mask_mod(b, h, q_idx, k_idx):
+                return q_idx >= k_idx
+        else:
+            def mask_mod(b, h, q_idx, k_idx):
+                return (q_idx >= k_idx) & (q_idx - k_idx < window)
+        bm = create_block_mask(mask_mod, B=None, H=None, Q_LEN=T, KV_LEN=T, device=device)
+        _BLOCK_MASK_CACHE[key] = bm
+    return bm
+
+
+def _flex_attn_impl(q, k, v, rel_logits, sinks, block_mask, rel_extent: int):
+    def score_mod(score, b, h, q_idx, k_idx):
+        d = q_idx - k_idx
+        ok = (d >= 0) & (d < rel_extent)
+        bias = torch.where(ok, rel_logits[b, h, q_idx, d.clamp(0, rel_extent - 1)], 0.0).to(score.dtype)
+        return score + bias
+
+    if _FLEX_USE_AUX:
+        out, aux = flex_attention(
+            q, k, v, score_mod=score_mod, block_mask=block_mask,
+            enable_gqa=True, return_aux=AuxRequest(lse=True),
+        )
+        lse = aux.lse
+    else:
+        out, lse = flex_attention(
+            q, k, v, score_mod=score_mod, block_mask=block_mask,
+            enable_gqa=True, return_lse=True,
+        )
+    return (out.float() * torch.sigmoid(lse.float() - sinks).unsqueeze(-1)).to(v.dtype)
+
+
+if flex_attention is not None:
+    if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        if hasattr(torch._dynamo.config, "recompile_limit"):
+            torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    _flex_attn_compiled = torch.compile(_flex_attn_impl)
+else:
+    _flex_attn_compiled = None
 
 
 class ShortConvolution(nn.Module):
@@ -221,13 +290,11 @@ class ShortConvolution(nn.Module):
         self.conv1d = nn.Conv1d(dim, dim, kernel, groups=dim, padding=kernel - 1, bias=False)
 
     def forward(self, x, dynamic_input=None):
-        # Same result as the depthwise F.conv1d of the reference, written as a sum of shifted
-        # copies: tap K-1 multiplies the current token, tap 0 the token K-1 steps back.
         xf = x.float()
         T, K = xf.shape[1], self.kernel
-        w = self.conv1d.weight.float()[:, 0, :]                                     # [dim, K]
-        padded = F.pad(xf, (0, 0, K - 1, 0))
-        y = sum(padded[:, k : k + T] * w[:, k] for k in range(K))
+        y = F.conv1d(
+            xf.transpose(1, 2), self.conv1d.weight.float(), padding=K - 1, groups=xf.shape[-1]
+        )[..., :T].transpose(1, 2)
         return ((y + xf) / math.sqrt(K + 1)).to(x.dtype)
 
 
@@ -306,20 +373,30 @@ class Attention(nn.Module):
     def __init__(self, cfg: InklingConfig, layer_idx: int):
         super().__init__()
         g = cfg.is_global(layer_idx)
+        self.use_flex_attn = cfg.use_flex_attn
+        self.window = None if g else cfg.sliding_window_size
         self.heads = cfg.num_attention_heads if g else cfg.swa_num_attention_heads
         self.kv_heads = cfg.num_key_value_heads if g else cfg.swa_num_key_value_heads
         self.head_dim = cfg.head_dim if g else cfg.swa_head_dim
-        rel_extent = cfg.rel_extent if g else cfg.sliding_window_size
+        self.rel_extent = cfg.rel_extent if g else cfg.sliding_window_size
         self.q_proj = QueryProjection(cfg, self.heads, self.head_dim, log_scaling=g)
         self.k_proj = KeyValueProjection(cfg, self.kv_heads, self.head_dim, is_key=True, dynamic=g)
         self.v_proj = KeyValueProjection(cfg, self.kv_heads, self.head_dim, is_key=False, dynamic=g)
         self.o_proj = GatedOutputProjection(cfg, self.heads, self.head_dim)
         self.sink_proj = nn.Linear(cfg.hidden_size, self.heads, bias=False)
-        self.relative_position_bias = RelativePositionBias(cfg, self.heads, rel_extent, log_scaling=g)
+        self.relative_position_bias = RelativePositionBias(cfg, self.heads, self.rel_extent, log_scaling=g)
 
     def forward(self, q_in, k_in, v_in, mask, dist, pos):
         B, T, _ = q_in.shape
         q, k, v = self.q_proj(q_in, pos), self.k_proj(k_in), self.v_proj(v_in)
+        if self.use_flex_attn and flex_attention is not None and q_in.is_cuda and T >= 128:
+            rel_logits = self.relative_position_bias.logits(q_in, pos)
+            sinks = self.sink_proj(q_in).transpose(1, 2).float()                    # [B, heads, T]
+            block_mask = _get_block_mask(T, self.window, q_in.device)
+            fn = _flex_attn_impl if torch.compiler.is_compiling() else _flex_attn_compiled
+            out = fn(q, k, v, rel_logits, sinks, block_mask, self.rel_extent)
+            out = out.transpose(1, 2).reshape(B, T, -1)
+            return self.o_proj(out, q_in)
         group = self.heads // self.kv_heads
         q = q.reshape(B, self.kv_heads, group, T, self.head_dim)
         scores = torch.matmul(q, k.unsqueeze(2).transpose(-1, -2)).reshape(B, self.heads, T, T)
@@ -339,6 +416,7 @@ class Router(nn.Module):
     def __init__(self, cfg: InklingConfig):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.hidden_size))
+        nn.init.normal_(self.weight, mean=0.0, std=cfg.initializer_range)
         # Added to the scores only when picking experts. Not trained by gradient.
         self.register_buffer("e_score_correction_bias", torch.zeros(cfg.n_routed_experts))
 
@@ -419,6 +497,8 @@ class Experts(nn.Module):
         else:
             self.gate_up_proj = nn.Parameter(torch.empty(E, 2 * inner, H))
             self.down_proj = nn.Parameter(torch.empty(E, H, inner))
+            nn.init.normal_(self.gate_up_proj, mean=0.0, std=cfg.initializer_range)
+            nn.init.normal_(self.down_proj, mean=0.0, std=cfg.initializer_range)
 
 
 class SparseMoeBlock(nn.Module):
@@ -431,7 +511,7 @@ class SparseMoeBlock(nn.Module):
         self.experts, self.gate = Experts(cfg), Router(cfg)
         self.mode, self.four_over_six = mode, cfg.four_over_six
         self.backward_mode = cfg.backward if mode != "none" else "exact"
-        self.backend = cfg.backend
+        self.backend, self.te_align = cfg.backend, cfg.te_align
         self.recipe = te_recipe(mode, cfg.te_recipe) if cfg.backend == "te" else None
         self.top_k, self.route_scale = cfg.num_experts_per_tok, cfg.route_scale
         self.gate_cap, self.up_cap = cfg.mlp_gate_softcap, cfg.mlp_up_softcap
@@ -459,11 +539,25 @@ class SparseMoeBlock(nn.Module):
         """Native path: Transformer Engine quantizes the operands and runs one GEMM per expert on
         consecutive rows of the input, m_splits[e] rows for expert e."""
         import transformer_engine.pytorch as te
-        x = flat[token]
+        work_dtype = torch.bfloat16 if (self.recipe is not None and flat.is_cuda and flat.dtype == torch.float32) else flat.dtype
+        align = self.te_align if self.recipe is not None else 1
+        if align <= 1:
+            x = flat[token].to(work_dtype)
+            with te.autocast(enabled=self.recipe is not None, recipe=self.recipe):
+                gate, up = self.experts.gate_up(x, counts).float().chunk(2, dim=-1)
+                act = softcap(gate, self.gate_cap) * torch.sigmoid(gate) * softcap(up, self.up_cap)
+                return self.experts.down(act.to(work_dtype), counts).float()
+        padded_counts = ((counts + align - 1) // align) * align
+        pos = torch.arange(token.numel(), device=flat.device) + (
+            (padded_counts.cumsum(0) - padded_counts) - (counts.cumsum(0) - counts)
+        )[sorted_expert]
+        x = flat.new_zeros((int(padded_counts.sum()), flat.shape[-1]), dtype=work_dtype)
+        x[pos] = flat[token].to(work_dtype)
         with te.autocast(enabled=self.recipe is not None, recipe=self.recipe):
-            gate, up = self.experts.gate_up(x, counts).float().chunk(2, dim=-1)
+            gate, up = self.experts.gate_up(x, padded_counts).float().chunk(2, dim=-1)
             act = softcap(gate, self.gate_cap) * torch.sigmoid(gate) * softcap(up, self.up_cap)
-            return self.experts.down(act.to(x.dtype), counts).float()
+            out = self.experts.down(act.to(work_dtype), padded_counts)
+        return out[pos].float()
 
     def _experts_sim(self, flat, token, sorted_expert, counts):
         """Simulated path: quantize-dequantize the operands, then ordinary batched GEMMs."""
@@ -471,30 +565,30 @@ class SparseMoeBlock(nn.Module):
         # All chunks run as one batched GEMM, [G, C, H] x [G, out, H], with each chunk using its
         # expert's weights. A busy expert gets several chunks and an idle one none, so the work
         # stays within 2x of the pairs that exist however uneven the routing is.
-        P, E, H, x = token.numel(), counts.numel(), flat.shape[-1], flat
+        P, E, H, x = token.numel(), counts.numel(), flat.shape[-1], flat.float()
         C = -(-P // E)
-        c = counts if x.is_cuda else counts.cpu()                 # small bookkeeping; cheap on the CPU
+        c = counts.cpu()                                          # 1 sync vs 2 on CUDA, zero tiny kernels
         start = torch.cumsum(c, 0) - c                            # first sorted position of each expert
         n_chunks = (c + C - 1) // C
         chunk_start = torch.cumsum(n_chunks, 0) - n_chunks
-        chunk_expert = torch.repeat_interleave(torch.arange(E, device=c.device), n_chunks)        # [G]
+        chunk_expert = torch.repeat_interleave(torch.arange(E), n_chunks)                         # [G]
         G = chunk_expert.numel()
-        first = start[chunk_expert] + (torch.arange(G, device=c.device) - chunk_start[chunk_expert]) * C
-        source = first[:, None] + torch.arange(C, device=c.device)[None, :]                       # [G, C]
+        first = start[chunk_expert] + (torch.arange(G) - chunk_start[chunk_expert]) * C
+        source = first[:, None] + torch.arange(C)[None, :]                                        # [G, C]
         valid = source < (start + c)[chunk_expert][:, None]
         source = source.clamp(max=P - 1)
         rank = torch.arange(P, device=x.device) - start.to(x.device)[sorted_expert]
         slot = (chunk_start.to(x.device)[sorted_expert] + torch.div(rank, C, rounding_mode="floor")) * C + rank % C
         chunk_expert, source, valid = chunk_expert.to(x.device), source.to(x.device), valid.to(x.device)
 
-        xq = quantize_act(flat, self.mode, self.four_over_six)
-        padded = xq[token[source]] * valid.unsqueeze(-1)                                        # [G, C, H]
+        xq = quantize_act(x, self.mode, self.four_over_six)
+        padded = xq[token[source]] * valid.unsqueeze(-1)                                          # [G, C, H]
         w_gate_up, w_down = self.quantized_weights()
         if G != E or not bool((n_chunks == 1).all()):
             w_gate_up, w_down = w_gate_up[chunk_expert], w_down[chunk_expert]
         gate, up = qgemm(padded, w_gate_up.to(padded.dtype), self.backward_mode).float().chunk(2, dim=-1)
         act = softcap(gate, self.gate_cap) * torch.sigmoid(gate) * softcap(up, self.up_cap)
-        act = quantize_act(act.to(padded.dtype), self.mode, self.four_over_six)
+        act = quantize_act(act, self.mode, self.four_over_six)
         return qgemm(act, w_down.to(padded.dtype), self.backward_mode).reshape(G * C, H)[slot].float()
 
     def forward(self, x):
@@ -707,25 +801,37 @@ class Inkling(nn.Module):
     def _run(self, layer, hidden, block_states, messages, masks, dist, pos):
         mask = masks[layer.is_global]
         if self.cfg.grad_checkpoint and self.training:
-            out = checkpoint(layer, hidden, block_states, messages, mask, dist, pos, use_reentrant=False)
+            ckpt_fn = checkpoint
+            if self.cfg.backend == "te":
+                try:
+                    from transformer_engine.pytorch.distributed import checkpoint as ckpt_fn
+                except ImportError:
+                    pass
+            out = ckpt_fn(layer, hidden, block_states, messages, mask, dist, pos, use_reentrant=False)
         else:
             out = layer(hidden, block_states, messages, mask, dist, pos)
         if layer.is_block_boundary:
             block_states = torch.cat([block_states, hidden.unsqueeze(-2)], dim=-2)
         return out, block_states
 
-    def forward(self, idx, targets=None, n_loops=None):
+    def forward(self, idx, targets=None, n_loops=None, return_logits: bool = True):
         cfg = self.cfg
         n_loops = n_loops or cfg.loop_num_passes
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
-        dist = pos[:, None] - pos[None, :]
-        full = torch.zeros(T, T, device=idx.device).masked_fill(dist < 0, float("-inf"))
-        masks = {True: full, False: full.masked_fill(dist >= cfg.sliding_window_size, float("-inf"))}
+        if cfg.use_flex_attn and flex_attention is not None and idx.is_cuda and T >= 128:
+            dist = None
+            masks = {True: None, False: None}
+        else:
+            dist = pos[:, None] - pos[None, :]
+            full = torch.zeros(T, T, device=idx.device).masked_fill(dist < 0, float("-inf"))
+            masks = {True: full, False: full.masked_fill(dist >= cfg.sliding_window_size, float("-inf"))}
         ls, le = cfg.loop_layer_index_start, cfg.loop_layer_index_end
         args = (masks, dist, pos)
 
         hidden = self.embed_tokens(idx)
+        if torch.is_autocast_enabled(idx.device.type):
+            hidden = hidden.to(torch.get_autocast_dtype(idx.device.type))
         block_states = hidden.new_zeros(B, T, 0, cfg.hidden_size)
         for layer in self.layers[:ls]:
             hidden, block_states = self._run(layer, hidden, block_states, None, *args)
@@ -750,6 +856,23 @@ class Inkling(nn.Module):
         for layer in self.layers[le:]:
             hidden, block_states = self._run(layer, hidden, block_states, None, *args)
         hidden = self.norm(self.final_input(block_states, hidden)[..., 0, :].to(hidden.dtype))
+        if targets is not None and not return_logits:
+            h_flat = hidden.reshape(-1, hidden.size(-1))
+            t_flat = targets.reshape(-1)
+            chunk = 1024
+
+            def _ce_chunk(h_c, t_c):
+                logits_c = softcap(self.lm_head(h_c).float(), cfg.final_logit_softcapping)
+                return F.cross_entropy(logits_c, t_c, reduction="sum")
+
+            total = h_flat.new_zeros((), dtype=torch.float32)
+            for s in range(0, h_flat.size(0), chunk):
+                h_c, t_c = h_flat[s : s + chunk], t_flat[s : s + chunk]
+                if self.training and h_c.requires_grad:
+                    total = total + checkpoint(_ce_chunk, h_c, t_c, use_reentrant=False)
+                else:
+                    total = total + _ce_chunk(h_c, t_c)
+            return None, total / t_flat.numel()
         logits = softcap(self.lm_head(hidden).float(), cfg.final_logit_softcapping)
         loss = None
         if targets is not None:
@@ -760,6 +883,9 @@ class Inkling(nn.Module):
     def generate(self, idx, max_new_tokens: int, temperature: float = 0.8, top_k: int = 50, n_loops=None):
         for _ in range(max_new_tokens):  # no KV cache: recomputes the context every token
             logits, _ = self(idx[:, -self.cfg.block_size:], n_loops=n_loops)
+            if temperature == 0:
+                idx = torch.cat([idx, logits[:, -1:].argmax(dim=-1)], dim=1)
+                continue
             logits = logits[:, -1] / temperature
             if top_k:
                 kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]

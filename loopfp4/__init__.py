@@ -12,6 +12,7 @@ from .inkling import Inkling, InklingConfig, param_counts  # noqa: F401
 from .inkling import PRESETS as INKLING_PRESETS
 from .model import Config, LoopedTransformer  # noqa: F401
 from .model import PRESETS as DENSE_PRESETS
+from .nvfp4 import nvfp4_unpack
 
 PRESETS = {**INKLING_PRESETS, **{f"dense-{k}": v for k, v in DENSE_PRESETS.items()}}
 
@@ -22,21 +23,45 @@ def build(cfg):
 
 def get_state(model) -> dict:
     """State dict for a checkpoint. The same layout whichever backend ran the expert GEMMs."""
-    return model.canonical_state_dict() if isinstance(model, Inkling) else model.state_dict()
+    if isinstance(model, Inkling):
+        return model.canonical_state_dict()
+    return {k: v for k, v in model.state_dict().items() if not k.endswith("._extra_state")}
 
 
 def set_state(model, state: dict):
-    model.load_canonical(state) if isinstance(model, Inkling) else model.load_state_dict(state)
+    if isinstance(model, Inkling):
+        return model.load_canonical(state)
+    clean = {k: v for k, v in state.items() if not k.endswith("._extra_state")}
+    missing, unexpected = model.load_state_dict(clean, strict=False)
+    missing = [k for k in missing if not k.endswith("._extra_state")]
+    assert not missing and not unexpected, (missing, unexpected)
 
 
 def load_checkpoint(path, map_location="cpu"):
     """Returns (model, checkpoint dict), with the model on the portable "sim" backend.
-    Checkpoints written before the Inkling model have no "arch"."""
+    Accepts both training checkpoints ("model") and 4-bit exported containers ("tensors")."""
     ck = torch.load(path, map_location=map_location)
     if ck.get("arch") == "inkling":
         cfg = InklingConfig(**{**ck["config"], "backend": "sim"})
     else:
         cfg = Config(**{**ck["config"], "backend": "sim"})
     model = build(cfg)
-    set_state(model, ck["model"])
+    if "tensors" in ck:
+        sd = {}
+        for k, v in ck["tensors"].items():
+            if isinstance(v, list):
+                sd[k] = torch.stack([nvfp4_unpack(p) for p in v])
+            elif isinstance(v, dict) and "codes" in v:
+                sd[k] = nvfp4_unpack(v)
+            else:
+                sd[k] = v.float()
+        if isinstance(model, Inkling):
+            for k, b in model.named_buffers():
+                if k.endswith(".mlp.usage"):
+                    sd.setdefault(k, b)
+        elif "emb.weight" in sd:
+            sd.setdefault("head.weight", sd["emb.weight"])
+        set_state(model, sd)
+    else:
+        set_state(model, ck["model"])
     return model, ck
