@@ -22,7 +22,7 @@ import time
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from loopfp4 import Config, InklingConfig, PRESETS, build
+from loopfp4 import Config, InklingConfig, PRESETS, build, get_state, set_state
 from loopfp4.data import ShardData
 
 
@@ -43,9 +43,14 @@ def parse():
     ap.add_argument("--backward", choices=["mxfp8", "exact"], help="precision of the expert backward GEMMs")
     ap.add_argument("--balance-rate", type=float, default=1e-3,
                     help="step size of the router's load-balancing bias; 0 turns balancing off")
+    ap.add_argument("--backend", choices=["sim", "te"],
+                    help="sim: 4-bit numerics simulated, runs anywhere. te: native NVFP4 GEMMs through "
+                         "NVIDIA Transformer Engine, Blackwell only. Default sim.")
+    ap.add_argument("--te-recipe", choices=["tml", "nvidia"],
+                    help="with --backend te on Inkling presets: Thinking Machines-style options (default) "
+                         "or Transformer Engine's default NVFP4 recipe")
     # dense-* presets only
     ap.add_argument("--quant-scope", choices=["all", "mlp"])
-    ap.add_argument("--backend", choices=["sim", "te"])
     ap.add_argument("--block-size", type=int)
     ap.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=None)
     # optimisation
@@ -103,12 +108,14 @@ def main():
     train = ShardData(args.data, "train", 1, 1, "cpu")  # opened early for its vocabulary size
     vocab = args.vocab_size or (None if init else train.meta.get("vocab_size"))
     overrides = {"quant": args.quant, "block_size": args.block_size, "grad_checkpoint": args.grad_checkpoint,
-                 "vocab_size": vocab}
+                 "vocab_size": vocab, "backend": args.backend or "sim"}  # the backend is chosen per run
     if ink:
         overrides.update(loop_num_passes=args.loops, n_routed_experts=args.experts, backward=args.backward,
-                         unpadded_vocab_size=vocab)
+                         unpadded_vocab_size=vocab, te_recipe=args.te_recipe)
     else:
-        overrides.update(n_loops=args.loops, quant_scope=args.quant_scope, backend=args.backend)
+        overrides.update(n_loops=args.loops, quant_scope=args.quant_scope)
+    if overrides["backend"] == "te" and not torch.cuda.is_available():
+        raise SystemExit("--backend te needs a Blackwell GPU and NVIDIA Transformer Engine; use --backend sim here")
     for field, val in overrides.items():
         if val is not None:
             setattr(cfg, field, val)
@@ -120,13 +127,15 @@ def main():
 
     model = build(cfg)
     if init:
-        model.load_state_dict(init["model"])
+        set_state(model, init["model"])
     model = model.to(device)
     raw = model
     if master:
         os.makedirs(args.out, exist_ok=True)
-        detail = (f"experts={cfg.num_experts_per_tok}/{cfg.n_routed_experts} backward={cfg.backward}" if ink
-                  else f"backend={cfg.backend}")
+        detail = f"backend={cfg.backend}"
+        if ink:
+            detail += f" experts={cfg.num_experts_per_tok}/{cfg.n_routed_experts} " + (
+                f"te_recipe={cfg.te_recipe}" if cfg.backend == "te" else f"backward={cfg.backward}")
         print(f"device={device} world={world} params={raw.num_params() / 1e6:.2f}M "
               f"applications={cfg.applications()} quant={cfg.quant} {detail}", flush=True)
 
@@ -144,7 +153,7 @@ def main():
     ckpt_path = os.path.join(args.out, "ckpt.pt")
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device)
-        raw.load_state_dict(ck["model"])
+        set_state(raw, ck["model"])
         opt.load_state_dict(ck["opt"])
         step = ck["step"]
         if master:
@@ -179,7 +188,7 @@ def main():
         return tot / args.eval_batches
 
     def save():
-        torch.save({"model": raw.state_dict(), "opt": opt.state_dict(), "step": step,
+        torch.save({"model": get_state(raw), "opt": opt.state_dict(), "step": step,
                     "arch": "inkling" if ink else "dense", "config": raw.config_dict(), "args": vars(args)},
                    ckpt_path)
 

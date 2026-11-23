@@ -5,7 +5,8 @@ end to end, starting with pretraining in 4-bit (NVFP4) on Blackwell GPUs.
 
 Where this stands: the text decoder and the 4-bit training recipe are implemented and checked
 on a laptop. The architecture produces the same outputs as the published reference
-implementation. Nothing has run on an NVIDIA GPU, and no training at real scale has happened.
+implementation. A native Blackwell path is written but has never been run. Nothing has run on
+an NVIDIA GPU, and no training at real scale has happened.
 
 ## The published pipeline, stage by stage
 
@@ -51,8 +52,42 @@ and 5 passes.
 | Four-Over-Six scale selection on activations | same |
 | Backward GEMMs in MXFP8 on the quantized forward operands, re-quantized after the transpose with stochastic rounding | same |
 | FP32 master weights, quantized on every forward pass | same |
-| Dedicated fused kernel on GB300, 15 PFLOPS in NVFP4 | **not here**: the numerics are simulated in ordinary float arithmetic, which is slower than BF16, not faster |
+| Dedicated fused kernel on GB300, 15 PFLOPS in NVFP4 | their kernel is not public. `--backend te` uses NVIDIA Transformer Engine's native NVFP4 GEMMs instead (written, **never run**); the default `--backend sim` simulates the numerics and is slower than BF16 |
 | Tokens sent between GPUs in NVFP4, Hadamard transform + S2F6 for gradients | not implemented (no cross-GPU expert dispatch here) |
+
+## Two ways to run the expert layers
+
+`--backend sim` (default) rounds every operand to its 4-bit value and multiplies in ordinary
+float arithmetic. It runs on any device and gives the numerics of 4-bit training, with no
+speedup. Everything tested so far used this.
+
+`--backend te` hands the expert GEMMs to NVIDIA Transformer Engine's `GroupedLinear`, which
+runs them natively in NVFP4 (MXFP8 in the last four layers) on Blackwell. It needs a
+Blackwell GPU and `transformer_engine`. **It has never been run.** It is written from the
+library's documentation and source, and tested only against a plain-PyTorch stand-in with
+the same interface, which checks this project's side of the hand-off and nothing about the
+library. On a machine that has Transformer Engine, `tests/test_inkling.py` runs those same
+checks against the real thing.
+
+`--te-recipe` picks the quantization options for the native path:
+
+| | `tml` (default) | `nvidia` |
+|---|---|---|
+| Weight block scales | 1x16, as published | 16x16 tiles |
+| Activation outer scale | per token, as published | per tensor |
+| Four-Over-Six on activations | yes, as published | no |
+| Hadamard transform | off | on |
+| Backward GEMMs | high precision, on the dequantized 4-bit operands | NVFP4 with stochastic rounding |
+
+- **Neither is exactly the published recipe.** Thinking Machines runs the backward GEMMs in
+  MXFP8; Transformer Engine offers NVFP4 or high precision for an NVFP4 layer, not MXFP8.
+  `tml` takes the more accurate of the two, so only its forward pass is accelerated.
+  `nvidia` is the fastest and is NVIDIA's own published pretraining recipe.
+- **Things to check on first contact with hardware:** that this option combination is
+  accepted for `GroupedLinear`, and that experts receiving zero tokens in a step are handled.
+  If `tml` is rejected, `--te-recipe nvidia` uses only library defaults.
+- **Checkpoints are the same for both backends,** so a model can be trained natively and
+  then pruned, exported or sampled anywhere.
 
 ## What is not published, and what I chose instead
 
@@ -150,14 +185,18 @@ python plan.py --preset 5b
 2. **First job: prove the pipeline.** `torchrun --nproc_per_node=8 train.py --preset smoke --data ... --steps 200`,
    then the same with `--preset 5b --batch-size 2`. Read `tok_per_s` from the log and pass it to
    `plan.py --tok-per-s-per-gpu` to replace the assumed throughput.
-3. **Pretrain, prune, heal** with the commands from the laptop check at the larger preset.
+3. **Try the native path.** Install NVIDIA Transformer Engine, run `python tests/test_inkling.py`,
+   then repeat the two jobs with `--backend te` and compare loss curves and `tok_per_s`
+   against `--backend sim`.
+4. **Pretrain, prune, heal** with the commands from the laptop check at the larger preset.
 
 Batch sizes, learning rates and step counts for `5b` have not been run.
 
 ## Not done
 
-- Nothing has run on an NVIDIA GPU: multi-GPU training and BF16 autocast are untested.
-- No native NVFP4 kernel. On Blackwell this code reproduces the 4-bit numerics but not the speed.
+- Nothing has run on an NVIDIA GPU: multi-GPU training, BF16 autocast and the native
+  `--backend te` path are untested.
+- No MXFP8 backward on the native path, and no fused kernel like the published one.
 - No expert sharding across GPUs, so the 26B and 75B configurations cannot be trained yet.
 - No vision tower, no multi-token-prediction head, no KV cache for generation.
 - No dataset beyond the TinyStories check, no fine-tuning or RL stage, no benchmark harness.

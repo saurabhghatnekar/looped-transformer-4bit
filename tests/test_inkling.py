@@ -189,6 +189,127 @@ def test_quantized_training_step_reduces_loss():
     assert loss.item() < 0.7 * first, (first, loss.item())
 
 
+
+# ----------------------------------------------------------------------------------------
+# Native backend (NVIDIA Transformer Engine). On a machine with Transformer Engine and a
+# Blackwell GPU these tests run against the real library. Elsewhere they run against the
+# stand-in below, which copies the documented GroupedLinear interface (one weight per GEMM
+# named weight0.., forward(inp, m_splits) on consecutive rows) in plain PyTorch. The stand-in
+# checks this project's side of the interface, not Transformer Engine itself.
+# ----------------------------------------------------------------------------------------
+
+_TE = []
+
+
+def _transformer_engine():
+    """Returns (device, calls). calls is None with the real library, else the stand-in's autocast log."""
+    if not _TE:
+        _TE.append(_find_transformer_engine())
+    return _TE[0]
+
+
+def _find_transformer_engine():
+    try:
+        import transformer_engine.pytorch as te  # noqa: F401
+        return "cuda", None
+    except ImportError:
+        pass
+    import contextlib
+    import types
+
+    calls = []
+
+    class GroupedLinear(torch.nn.Module):
+        def __init__(self, num_gemms, in_features, out_features, bias=True, init_method=None, **kwargs):
+            super().__init__()
+            assert not bias
+            self.num_gemms = num_gemms
+            for i in range(num_gemms):
+                w = torch.nn.Parameter(torch.empty(out_features, in_features))
+                init_method(w)
+                self.register_parameter(f"weight{i}", w)
+
+        def forward(self, inp, m_splits):
+            assert inp.dim() == 2 and tuple(m_splits.shape) == (self.num_gemms,)
+            assert int(m_splits.sum()) == inp.shape[0]
+            parts = torch.split(inp, m_splits.tolist())
+            return torch.cat([F.linear(part, getattr(self, f"weight{i}")) for i, part in enumerate(parts)])
+
+    @contextlib.contextmanager
+    def autocast(enabled=True, recipe=None):
+        calls.append((enabled, recipe))
+        yield
+
+    class _Recipe:
+        def __init__(self, **options):
+            self.options = options
+
+    class NVFP4BlockScaling(_Recipe):
+        pass
+
+    class MXFP8BlockScaling(_Recipe):
+        pass
+
+    te = types.ModuleType("transformer_engine.pytorch")
+    te.GroupedLinear, te.autocast = GroupedLinear, autocast
+    recipe = types.ModuleType("transformer_engine.common.recipe")
+    recipe.NVFP4BlockScaling, recipe.MXFP8BlockScaling = NVFP4BlockScaling, MXFP8BlockScaling
+    root, common = types.ModuleType("transformer_engine"), types.ModuleType("transformer_engine.common")
+    root.pytorch, root.common, common.recipe = te, common, recipe
+    sys.modules.update({"transformer_engine": root, "transformer_engine.pytorch": te,
+                        "transformer_engine.common": common, "transformer_engine.common.recipe": recipe})
+    return "cpu", calls
+
+
+def test_native_backend_matches_simulated_in_full_precision():
+    device, calls = _transformer_engine()
+    sim = randomise(Inkling(InklingConfig(**TINY, quant="none"))).to(device)
+    native = Inkling(InklingConfig(**TINY, quant="none", backend="te")).to(device)
+    native.load_canonical(sim.state_dict())
+    assert sim.num_params() == native.num_params()
+    idx = torch.randint(0, 64, (2, 25), device=device)
+    (ls, loss_s), (ln, loss_n) = sim(idx[:, :-1], idx[:, 1:]), native(idx[:, :-1], idx[:, 1:])
+    tol = 1e-4 if device == "cpu" else 5e-2                                     # the real library computes in BF16
+    assert (ls - ln).abs().max() < tol, (ls - ln).abs().max()
+    loss_s.backward()
+    loss_n.backward()
+    moe_s, moe_n = sim.layers[3].mlp.experts, native.layers[3].mlp.experts
+    grad_n = torch.stack([getattr(moe_n.gate_up, f"weight{e}").grad for e in range(8)]).float()
+    assert (moe_s.gate_up_proj.grad - grad_n).abs().max() < tol * moe_s.gate_up_proj.grad.abs().max().clamp(min=1)
+    if calls is not None:
+        assert calls and all(enabled is False and recipe is None for enabled, recipe in calls)
+
+
+def test_checkpoints_do_not_depend_on_the_backend():
+    device, _ = _transformer_engine()
+    native = randomise(Inkling(InklingConfig(**TINY, backend="te"))).to(device)
+    state = native.canonical_state_dict()
+    sim = Inkling(InklingConfig(**TINY))
+    assert set(state) == set(sim.state_dict())                                  # same keys as the simulated layout
+    sim.load_state_dict({k: v.cpu() for k, v in state.items()})
+    again = Inkling(InklingConfig(**TINY, backend="te")).to(device)
+    again.load_canonical(sim.canonical_state_dict())
+    for (name, a), (_, b) in zip(native.named_parameters(), again.named_parameters()):
+        assert torch.equal(a.float().cpu(), b.float().cpu()), name
+
+
+def test_native_recipes_by_layer():
+    device, calls = _transformer_engine()
+    if calls is None:
+        return  # real library: recipe objects are not inspectable the same way
+    model = Inkling(InklingConfig(**TINY, backend="te"))
+    kinds = [type(layer.mlp.recipe).__name__ for layer in model.layers]
+    assert kinds == ["NVFP4BlockScaling"] * 6 + ["MXFP8BlockScaling"] * 2       # last hp_tail_layers in MXFP8
+    assert model.layers[0].mlp.recipe.options == dict(
+        disable_2d_quantization=True, row_scaled_activation=True, nvfp4_4over6="activations",
+        disable_rht=True, backward_override="dequantized")
+    stock = Inkling(InklingConfig(**TINY, backend="te", te_recipe="nvidia"))
+    assert stock.layers[0].mlp.recipe.options == {}
+    del calls[:]
+    model(torch.randint(0, 64, (1, 8)))
+    assert all(enabled for enabled, _ in calls) and len(calls) == 8 + 2 * 4      # 8 layers, 4 looped twice more
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

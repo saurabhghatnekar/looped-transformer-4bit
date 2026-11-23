@@ -74,6 +74,11 @@ class InklingConfig:
     four_over_six: bool = True               # 4/6 scale selection on expert activations
     backward: str = "mxfp8"                  # "mxfp8" (stochastic rounding) | "exact" backward GEMMs
     grad_checkpoint: bool = False
+    # How the expert GEMMs are computed. "sim": 4-bit numerics in ordinary float maths, runs
+    # anywhere, no speedup. "te": NVIDIA Transformer Engine's GroupedLinear, native NVFP4 / MXFP8
+    # GEMMs on Blackwell. A runtime choice: checkpoints are the same for both.
+    backend: str = "sim"
+    te_recipe: str = "tml"                   # "tml" | "nvidia", see te_recipe() below
 
     def is_global(self, i: int) -> bool:
         return (i + 1) % self.global_every == 0
@@ -338,12 +343,51 @@ class Router(nn.Module):
         self.register_buffer("e_score_correction_bias", torch.zeros(cfg.n_routed_experts))
 
 
+def te_recipe(mode: str, style: str):
+    """Transformer Engine quantization recipe for one expert layer (None = high precision).
+
+    "tml" sets the documented options that line up with Thinking Machines' recipe: 1x16 weight
+    scales instead of 16x16 tiles, one outer scale per token for activations, Four-Over-Six on
+    activations, no Hadamard transform. Transformer Engine has no MXFP8 backward for NVFP4
+    layers, so the backward GEMMs run in high precision on the dequantized 4-bit operands:
+    more accurate than the published MXFP8 backward, and not accelerated.
+
+    "nvidia" is Transformer Engine's default NVFP4 recipe: 16x16 weight tiles, Hadamard
+    transforms, and NVFP4 backward GEMMs with stochastic rounding. Fastest.
+
+    The last layers (mode "mxfp8") use the stock MXFP8 recipe, forward and backward, either way.
+    """
+    if mode == "none":
+        return None
+    from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
+    if mode == "mxfp8":
+        return MXFP8BlockScaling()
+    if style == "nvidia":
+        return NVFP4BlockScaling()
+    try:
+        return NVFP4BlockScaling(disable_2d_quantization=True, row_scaled_activation=True,
+                                 nvfp4_4over6="activations", disable_rht=True, backward_override="dequantized")
+    except TypeError as err:
+        raise RuntimeError("This Transformer Engine release lacks an option the 'tml' recipe needs "
+                           f"({err}). Upgrade it, or run with --te-recipe nvidia.") from err
+
+
 class Experts(nn.Module):
+    """Expert weights. "sim": two stacked parameters, gate_up_proj [E, 2*inner, H] and
+    down_proj [E, H, inner]. "te": two GroupedLinear modules holding one weight per expert
+    (weight0 .. weight{E-1}); Inkling.canonical_state_dict() stacks them back."""
+
     def __init__(self, cfg: InklingConfig):
         super().__init__()
         E, H, inner = cfg.n_routed_experts, cfg.hidden_size, cfg.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(torch.empty(E, 2 * inner, H))
-        self.down_proj = nn.Parameter(torch.empty(E, H, inner))
+        if cfg.backend == "te":
+            import transformer_engine.pytorch as te
+            init = lambda w: nn.init.normal_(w, mean=0.0, std=cfg.initializer_range)
+            self.gate_up = te.GroupedLinear(E, H, 2 * inner, bias=False, init_method=init)
+            self.down = te.GroupedLinear(E, inner, H, bias=False, init_method=init)
+        else:
+            self.gate_up_proj = nn.Parameter(torch.empty(E, 2 * inner, H))
+            self.down_proj = nn.Parameter(torch.empty(E, H, inner))
 
 
 class SparseMoeBlock(nn.Module):
@@ -356,6 +400,8 @@ class SparseMoeBlock(nn.Module):
         self.experts, self.gate = Experts(cfg), Router(cfg)
         self.mode, self.four_over_six = mode, cfg.four_over_six
         self.backward_mode = cfg.backward if mode != "none" else "exact"
+        self.backend = cfg.backend
+        self.recipe = te_recipe(mode, cfg.te_recipe) if cfg.backend == "te" else None
         self.top_k, self.route_scale = cfg.num_experts_per_tok, cfg.route_scale
         self.gate_cap, self.up_cap = cfg.mlp_gate_softcap, cfg.mlp_up_softcap
         self.register_buffer("usage", torch.zeros(cfg.n_routed_experts))            # running share of load
@@ -378,24 +424,24 @@ class SparseMoeBlock(nn.Module):
         weights = scores.gather(1, index)
         return index, weights / (weights.sum(-1, keepdim=True) + 1e-20) * self.route_scale
 
-    def forward(self, x):
-        B, T, H = x.shape
-        N, k, E = B * T, self.top_k, self.gate.weight.shape[0]
-        flat = x.reshape(N, H)
-        index, weights = self.route(flat)
+    def _experts_te(self, flat, token, sorted_expert, counts):
+        """Native path: Transformer Engine quantizes the operands and runs one GEMM per expert on
+        consecutive rows of the input, m_splits[e] rows for expert e."""
+        import transformer_engine.pytorch as te
+        x = flat[token]
+        with te.autocast(enabled=self.recipe is not None, recipe=self.recipe):
+            gate, up = self.experts.gate_up(x, counts).float().chunk(2, dim=-1)
+            act = softcap(gate, self.gate_cap) * torch.sigmoid(gate) * softcap(up, self.up_cap)
+            return self.experts.down(act.to(x.dtype), counts).float()
 
-        # Group the N*k (token, expert) pairs by expert, then cut each expert's group into chunks
-        # of at most C pairs (C = the mean load). All chunks run as one batched GEMM,
-        # [G, C, H] x [G, out, H], with each chunk using its expert's weights. A busy expert gets
-        # several chunks and an idle one none, so the work stays within 2x of the pairs that
-        # exist however uneven the routing is.
-        expert = index.reshape(-1)
-        counts = torch.zeros(E, dtype=torch.long, device=x.device).scatter_add_(0, expert, torch.ones_like(expert))
-        if self.training:
-            self.step_counts += counts
-        sorted_expert, order = torch.sort(expert)
-        token = torch.div(order, k, rounding_mode="floor")
-        C = -(-N * k // E)
+    def _experts_sim(self, flat, token, sorted_expert, counts):
+        """Simulated path: quantize-dequantize the operands, then ordinary batched GEMMs."""
+        # Cut each expert's group of pairs into chunks of at most C pairs (C = the mean load).
+        # All chunks run as one batched GEMM, [G, C, H] x [G, out, H], with each chunk using its
+        # expert's weights. A busy expert gets several chunks and an idle one none, so the work
+        # stays within 2x of the pairs that exist however uneven the routing is.
+        P, E, H, x = token.numel(), counts.numel(), flat.shape[-1], flat
+        C = -(-P // E)
         c = counts if x.is_cuda else counts.cpu()                 # small bookkeeping; cheap on the CPU
         start = torch.cumsum(c, 0) - c                            # first sorted position of each expert
         n_chunks = (c + C - 1) // C
@@ -405,8 +451,8 @@ class SparseMoeBlock(nn.Module):
         first = start[chunk_expert] + (torch.arange(G, device=c.device) - chunk_start[chunk_expert]) * C
         source = first[:, None] + torch.arange(C, device=c.device)[None, :]                       # [G, C]
         valid = source < (start + c)[chunk_expert][:, None]
-        source = source.clamp(max=N * k - 1)
-        rank = torch.arange(N * k, device=x.device) - start.to(x.device)[sorted_expert]
+        source = source.clamp(max=P - 1)
+        rank = torch.arange(P, device=x.device) - start.to(x.device)[sorted_expert]
         slot = (chunk_start.to(x.device)[sorted_expert] + torch.div(rank, C, rounding_mode="floor")) * C + rank % C
         chunk_expert, source, valid = chunk_expert.to(x.device), source.to(x.device), valid.to(x.device)
 
@@ -418,7 +464,23 @@ class SparseMoeBlock(nn.Module):
         gate, up = qgemm(padded, w_gate_up.to(padded.dtype), self.backward_mode).float().chunk(2, dim=-1)
         act = softcap(gate, self.gate_cap) * torch.sigmoid(gate) * softcap(up, self.up_cap)
         act = quantize_act(act.to(padded.dtype), self.mode, self.four_over_six)
-        y = qgemm(act, w_down.to(padded.dtype), self.backward_mode).reshape(G * C, H)[slot].float()
+        return qgemm(act, w_down.to(padded.dtype), self.backward_mode).reshape(G * C, H)[slot].float()
+
+    def forward(self, x):
+        B, T, H = x.shape
+        N, k, E = B * T, self.top_k, self.gate.weight.shape[0]
+        flat = x.reshape(N, H)
+        index, weights = self.route(flat)
+
+        # Sort the N*k (token, expert) pairs by expert.
+        expert = index.reshape(-1)
+        counts = torch.zeros(E, dtype=torch.long, device=x.device).scatter_add_(0, expert, torch.ones_like(expert))
+        if self.training:
+            self.step_counts += counts
+        sorted_expert, order = torch.sort(expert)
+        token = torch.div(order, k, rounding_mode="floor")
+        run = self._experts_te if self.backend == "te" else self._experts_sim
+        y = run(flat, token, sorted_expert, counts)                                 # [N*k, H], in sorted order
         y = y * weights.reshape(-1)[order].unsqueeze(-1)
         out = torch.zeros(N, H, dtype=torch.float32, device=x.device).index_add(0, token, y)
         return out.to(x.dtype).view(B, T, H)
@@ -572,7 +634,7 @@ class Inkling(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=std)
         elif isinstance(m, RelativePositionBias):
             nn.init.normal_(m.proj, mean=0.0, std=std)
-        elif isinstance(m, Experts):
+        elif isinstance(m, Experts) and self.cfg.backend != "te":
             nn.init.normal_(m.gate_up_proj, mean=0.0, std=std)
             nn.init.normal_(m.down_proj, mean=0.0, std=std)
         elif isinstance(m, Router):
@@ -676,6 +738,36 @@ class Inkling(nn.Module):
 
     def config_dict(self) -> dict:
         return asdict(self.cfg)
+
+    _TE_PARTS = (("gate_up", "gate_up_proj"), ("down", "down_proj"))
+
+    def canonical_state_dict(self) -> dict:
+        """State dict in the "sim" layout whatever the backend, so checkpoints, pruning and
+        export do not depend on how the expert GEMMs were run."""
+        sd = self.state_dict()
+        if self.cfg.backend != "te":
+            return sd
+        E = self.cfg.n_routed_experts
+        for i in range(self.cfg.num_hidden_layers):
+            pre = f"layers.{i}.mlp.experts."
+            for module, stacked in self._TE_PARTS:
+                sd[pre + stacked] = torch.stack([sd[f"{pre}{module}.weight{e}"].float() for e in range(E)])
+            for key in [k for k in sd if k.startswith((pre + "gate_up.", pre + "down."))]:
+                del sd[key]  # per-expert weights and any Transformer Engine bookkeeping
+        return sd
+
+    def load_canonical(self, sd: dict):
+        if self.cfg.backend != "te":
+            return self.load_state_dict(sd)
+        sd = dict(sd)
+        for i in range(self.cfg.num_hidden_layers):
+            pre = f"layers.{i}.mlp.experts."
+            for module, stacked in self._TE_PARTS:
+                for e, w in enumerate(sd.pop(pre + stacked)):
+                    sd[f"{pre}{module}.weight{e}"] = w
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        missing = [k for k in missing if ".experts." not in k]  # Transformer Engine's own buffers
+        assert not missing and not unexpected, (missing, unexpected)
 
 
 def param_counts(cfg: InklingConfig, n_loops=None) -> dict:

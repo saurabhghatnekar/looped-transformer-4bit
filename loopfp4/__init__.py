@@ -20,10 +20,23 @@ def build(cfg):
     return Inkling(cfg) if isinstance(cfg, InklingConfig) else LoopedTransformer(cfg)
 
 
+def get_state(model) -> dict:
+    """State dict for a checkpoint. The same layout whichever backend ran the expert GEMMs."""
+    return model.canonical_state_dict() if isinstance(model, Inkling) else model.state_dict()
+
+
+def set_state(model, state: dict):
+    model.load_canonical(state) if isinstance(model, Inkling) else model.load_state_dict(state)
+
+
 def load_checkpoint(path, map_location="cpu"):
-    """Returns (model, checkpoint dict). Checkpoints written before the Inkling model have no "arch"."""
+    """Returns (model, checkpoint dict), with the model on the portable "sim" backend.
+    Checkpoints written before the Inkling model have no "arch"."""
     ck = torch.load(path, map_location=map_location)
-    cfg = InklingConfig(**ck["config"]) if ck.get("arch") == "inkling" else Config(**ck["config"])
+    if ck.get("arch") == "inkling":
+        cfg = InklingConfig(**{**ck["config"], "backend": "sim"})
+    else:
+        cfg = Config(**{**ck["config"], "backend": "sim"})
     model = build(cfg)
-    model.load_state_dict(ck["model"])
+    set_state(model, ck["model"])
     return model, ck
