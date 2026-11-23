@@ -1,0 +1,9 @@
+# datasets and token shards (re-create with prepare_data.py)
+data/
+# training runs: checkpoints, logs, exported models
+runs/
+*.pt
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
