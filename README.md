@@ -71,21 +71,26 @@ checks against the real thing.
 
 `--te-recipe` picks the quantization options for the native path:
 
-| | `tml` (default) | `nvidia` |
-|---|---|---|
-| Weight block scales | 1x16, as published | 16x16 tiles |
-| Activation outer scale | per token, as published | per tensor |
-| Four-Over-Six on activations | yes, as published | no |
-| Hadamard transform | off | on |
-| Backward GEMMs | high precision, on the dequantized 4-bit operands | NVFP4 with stochastic rounding |
+| | `tml` (default) | `rowscaled` | `nvidia` |
+|---|---|---|---|
+| Forward GEMM | NVFP4 | NVFP4 | NVFP4 |
+| Weight block scales | 1x16, as published | 1x16 | 16x16 tiles |
+| Activation outer scale | per token, as published | per token | per tensor |
+| Four-Over-Six on activations | yes, as published | no | no |
+| Backward GEMMs | MXFP8, as published | MXFP8 | NVFP4 with stochastic rounding |
+| Backward operands | re-quantized from the dequantized 4-bit forward values, as published | same | quantized from the originals |
+| Hadamard transform | off | off | on |
+| Built from | Transformer Engine's fine-grained recipes (experimental) | a factory Transformer Engine ships, unmodified | its default NVFP4 recipe |
 
-- **Neither is exactly the published recipe.** Thinking Machines runs the backward GEMMs in
-  MXFP8; Transformer Engine offers NVFP4 or high precision for an NVFP4 layer, not MXFP8.
-  `tml` takes the more accurate of the two, so only its forward pass is accelerated.
-  `nvidia` is the fastest and is NVIDIA's own published pretraining recipe.
-- **Things to check on first contact with hardware:** that this option combination is
-  accepted for `GroupedLinear`, and that experts receiving zero tokens in a step are handled.
-  If `tml` is rejected, `--te-recipe nvidia` uses only library defaults.
+- **`tml` is the published recipe except for one detail.** Thinking Machines re-quantizes the
+  backward operands with stochastic rounding; Transformer Engine's MXFP8 quantizer has no
+  stochastic-rounding option, so that step rounds to nearest.
+- **`rowscaled`** is Transformer Engine's own `nvfp4_row_scaled_fwd_mxfp8_bwd_factory`. `tml`
+  is that factory plus Four-Over-Six. Use it if the Four-Over-Six options are rejected.
+- **`nvidia`** is NVIDIA's published pretraining recipe and uses only stable options.
+- **Things to check on first contact with hardware:** that the `tml` quantizer options are
+  accepted together for `GroupedLinear`, that the GEMMs run on optimized kernels and not
+  fallbacks, and that experts receiving zero tokens in a step are handled.
 - **Checkpoints are the same for both backends,** so a model can be trained natively and
   then pruned, exported or sampled anywhere.
 
@@ -196,7 +201,7 @@ Batch sizes, learning rates and step counts for `5b` have not been run.
 
 - Nothing has run on an NVIDIA GPU: multi-GPU training, BF16 autocast and the native
   `--backend te` path are untested.
-- No MXFP8 backward on the native path, and no fused kernel like the published one.
+- No stochastic rounding in the native path's MXFP8 backward, and no fused kernel like the published one.
 - No expert sharding across GPUs, so the 26B and 75B configurations cannot be trained yet.
 - No vision tower, no multi-token-prediction head, no KV cache for generation.
 - No dataset beyond the TinyStories check, no fine-tuning or RL stage, no benchmark harness.

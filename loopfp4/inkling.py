@@ -78,7 +78,7 @@ class InklingConfig:
     # anywhere, no speedup. "te": NVIDIA Transformer Engine's GroupedLinear, native NVFP4 / MXFP8
     # GEMMs on Blackwell. A runtime choice: checkpoints are the same for both.
     backend: str = "sim"
-    te_recipe: str = "tml"                   # "tml" | "nvidia", see te_recipe() below
+    te_recipe: str = "tml"                   # "tml" | "rowscaled" | "nvidia", see te_recipe() below
 
     def is_global(self, i: int) -> bool:
         return (i + 1) % self.global_every == 0
@@ -343,19 +343,45 @@ class Router(nn.Module):
         self.register_buffer("e_score_correction_bias", torch.zeros(cfg.n_routed_experts))
 
 
+def tml_quantizer_factory(role):
+    """Transformer Engine quantizer per tensor slot, following the published 4-bit recipe:
+
+        forward GEMM   input (NVFP4, one outer scale per token, Four-Over-Six) x weight (NVFP4, 1x16 scales)
+        backward GEMMs MXFP8, on operands re-quantized from the dequantized 4-bit forward values
+
+    This is Transformer Engine's own `nvfp4_row_scaled_fwd_mxfp8_bwd_factory` plus Four-Over-Six on
+    the activations. One piece of the published recipe is missing: Transformer Engine's MXFP8
+    quantizer has no stochastic-rounding option, so the re-quantization rounds to nearest.
+    """
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.custom_recipes.quantizer_factories import mxfp8_factory
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
+
+    plain = dict(with_rht=False, with_post_rht_amax=False, with_2d_quantization=False, stochastic_rounding=False)
+    kind = role.tensor_type if role is not None else ""
+    if kind == "input":
+        # 256 instead of 448 as the block-scale bound leaves room for the 1.5x larger scale that
+        # mapping a block to 4 instead of 6 needs; it is what the stock recipe uses with 4/6.
+        forward = NVFP4Quantizer(**plain, row_scaled_nvfp4=True, nvfp4_use_4over6=True, nvfp4_e4m3_max=256,
+                                 nvfp4_4over6_err_mode="MSE")
+    elif kind == "weight":
+        forward = NVFP4Quantizer(**plain)
+    else:  # grad_output, and any slot this factory does not know: MXFP8
+        return mxfp8_factory(role)
+    return te.HybridQuantizer(rowwise_quantizer=forward, columnwise_quantizer=mxfp8_factory(role),
+                              columnwise_source="rowwise_dequantized")
+
+
 def te_recipe(mode: str, style: str):
-    """Transformer Engine quantization recipe for one expert layer (None = high precision).
+    """Transformer Engine recipe for one expert layer (None = high precision).
 
-    "tml" sets the documented options that line up with Thinking Machines' recipe: 1x16 weight
-    scales instead of 16x16 tiles, one outer scale per token for activations, Four-Over-Six on
-    activations, no Hadamard transform. Transformer Engine has no MXFP8 backward for NVFP4
-    layers, so the backward GEMMs run in high precision on the dequantized 4-bit operands:
-    more accurate than the published MXFP8 backward, and not accelerated.
+    "tml"        tml_quantizer_factory above: NVFP4 forward, MXFP8 backward, Four-Over-Six.
+    "rowscaled"  the same without Four-Over-Six, using only the factory Transformer Engine ships.
+    "nvidia"     Transformer Engine's default NVFP4 recipe: 16x16 weight tiles, Hadamard
+                 transforms, NVFP4 backward GEMMs with stochastic rounding.
 
-    "nvidia" is Transformer Engine's default NVFP4 recipe: 16x16 weight tiles, Hadamard
-    transforms, and NVFP4 backward GEMMs with stochastic rounding. Fastest.
-
-    The last layers (mode "mxfp8") use the stock MXFP8 recipe, forward and backward, either way.
+    "tml" and "rowscaled" use Transformer Engine's fine-grained recipes, which it marks
+    experimental. The last layers (mode "mxfp8") use the stock MXFP8 recipe in every case.
     """
     if mode == "none":
         return None
@@ -365,11 +391,16 @@ def te_recipe(mode: str, style: str):
     if style == "nvidia":
         return NVFP4BlockScaling()
     try:
-        return NVFP4BlockScaling(disable_2d_quantization=True, row_scaled_activation=True,
-                                 nvfp4_4over6="activations", disable_rht=True, backward_override="dequantized")
-    except TypeError as err:
-        raise RuntimeError("This Transformer Engine release lacks an option the 'tml' recipe needs "
-                           f"({err}). Upgrade it, or run with --te-recipe nvidia.") from err
+        from transformer_engine.common.recipe import CustomRecipe
+        if style == "rowscaled":
+            from transformer_engine.pytorch.custom_recipes.quantizer_factory_zoo import (
+                nvfp4_row_scaled_fwd_mxfp8_bwd_factory)
+            return CustomRecipe(qfactory=nvfp4_row_scaled_fwd_mxfp8_bwd_factory)
+        tml_quantizer_factory(None)  # fail here, not mid-training, if an option is missing
+        return CustomRecipe(qfactory=tml_quantizer_factory)
+    except (ImportError, TypeError) as err:
+        raise RuntimeError(f"This Transformer Engine release cannot build the '{style}' recipe ({err}). "
+                           "Upgrade it, or run with --te-recipe nvidia.") from err
 
 
 class Experts(nn.Module):

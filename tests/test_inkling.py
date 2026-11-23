@@ -240,24 +240,33 @@ def _find_transformer_engine():
         calls.append((enabled, recipe))
         yield
 
-    class _Recipe:
-        def __init__(self, **options):
-            self.options = options
+    class _Options:  # records the keyword arguments it was built with
+        def __init__(self, *args, **options):
+            self.args, self.options = args, options
 
-    class NVFP4BlockScaling(_Recipe):
-        pass
+    names = ["NVFP4BlockScaling", "MXFP8BlockScaling", "CustomRecipe", "HybridQuantizer", "NVFP4Quantizer",
+             "MXFP8Quantizer"]
+    kinds = {name: type(name, (_Options,), {}) for name in names}
 
-    class MXFP8BlockScaling(_Recipe):
-        pass
+    def module(name, **members):
+        mod = types.ModuleType(name)
+        for key, value in members.items():
+            setattr(mod, key, value)
+        sys.modules[name] = mod
+        return mod
 
-    te = types.ModuleType("transformer_engine.pytorch")
-    te.GroupedLinear, te.autocast = GroupedLinear, autocast
-    recipe = types.ModuleType("transformer_engine.common.recipe")
-    recipe.NVFP4BlockScaling, recipe.MXFP8BlockScaling = NVFP4BlockScaling, MXFP8BlockScaling
-    root, common = types.ModuleType("transformer_engine"), types.ModuleType("transformer_engine.common")
-    root.pytorch, root.common, common.recipe = te, common, recipe
-    sys.modules.update({"transformer_engine": root, "transformer_engine.pytorch": te,
-                        "transformer_engine.common": common, "transformer_engine.common.recipe": recipe})
+    module("transformer_engine")
+    module("transformer_engine.common")
+    module("transformer_engine.common.recipe", **{k: kinds[k] for k in names[:3]})
+    module("transformer_engine.pytorch", GroupedLinear=GroupedLinear, autocast=autocast,
+           HybridQuantizer=kinds["HybridQuantizer"])
+    module("transformer_engine.pytorch.tensor")
+    module("transformer_engine.pytorch.tensor.nvfp4_tensor", NVFP4Quantizer=kinds["NVFP4Quantizer"])
+    module("transformer_engine.pytorch.custom_recipes")
+    module("transformer_engine.pytorch.custom_recipes.quantizer_factories",
+           mxfp8_factory=lambda role: kinds["MXFP8Quantizer"]())
+    module("transformer_engine.pytorch.custom_recipes.quantizer_factory_zoo",
+           nvfp4_row_scaled_fwd_mxfp8_bwd_factory=lambda role: None)
     return "cpu", calls
 
 
@@ -299,12 +308,28 @@ def test_native_recipes_by_layer():
         return  # real library: recipe objects are not inspectable the same way
     model = Inkling(InklingConfig(**TINY, backend="te"))
     kinds = [type(layer.mlp.recipe).__name__ for layer in model.layers]
-    assert kinds == ["NVFP4BlockScaling"] * 6 + ["MXFP8BlockScaling"] * 2       # last hp_tail_layers in MXFP8
-    assert model.layers[0].mlp.recipe.options == dict(
-        disable_2d_quantization=True, row_scaled_activation=True, nvfp4_4over6="activations",
-        disable_rht=True, backward_override="dequantized")
+    assert kinds == ["CustomRecipe"] * 6 + ["MXFP8BlockScaling"] * 2            # last hp_tail_layers in MXFP8
+
+    # The published recipe, slot by slot: 4-bit forward operands, 8-bit backward operands made
+    # from the dequantized forward values, 8-bit gradients.
+    import types
+    factory = model.layers[0].mlp.recipe.options["qfactory"]
+    role = lambda kind: types.SimpleNamespace(module_type="grouped_linear", tensor_type=kind, name="")
+    plain = dict(with_rht=False, with_post_rht_amax=False, with_2d_quantization=False, stochastic_rounding=False)
+    for kind, extra in (("input", dict(row_scaled_nvfp4=True, nvfp4_use_4over6=True, nvfp4_e4m3_max=256,
+                                       nvfp4_4over6_err_mode="MSE")), ("weight", {})):
+        hybrid = factory(role(kind)).options
+        assert type(hybrid["rowwise_quantizer"]).__name__ == "NVFP4Quantizer"
+        assert hybrid["rowwise_quantizer"].options == {**plain, **extra}
+        assert type(hybrid["columnwise_quantizer"]).__name__ == "MXFP8Quantizer"
+        assert hybrid["columnwise_source"] == "rowwise_dequantized"
+    assert type(factory(role("grad_output"))).__name__ == "MXFP8Quantizer"
+    assert type(factory(None)).__name__ == "MXFP8Quantizer"
+
+    shipped = Inkling(InklingConfig(**TINY, backend="te", te_recipe="rowscaled"))
+    assert type(shipped.layers[0].mlp.recipe).__name__ == "CustomRecipe"
     stock = Inkling(InklingConfig(**TINY, backend="te", te_recipe="nvidia"))
-    assert stock.layers[0].mlp.recipe.options == {}
+    assert type(stock.layers[0].mlp.recipe).__name__ == "NVFP4BlockScaling" and stock.layers[0].mlp.recipe.options == {}
     del calls[:]
     model(torch.randint(0, 64, (1, 8)))
     assert all(enabled for enabled, _ in calls) and len(calls) == 8 + 2 * 4      # 8 layers, 4 looped twice more

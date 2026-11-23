@@ -46,9 +46,10 @@ def parse():
     ap.add_argument("--backend", choices=["sim", "te"],
                     help="sim: 4-bit numerics simulated, runs anywhere. te: native NVFP4 GEMMs through "
                          "NVIDIA Transformer Engine, Blackwell only. Default sim.")
-    ap.add_argument("--te-recipe", choices=["tml", "nvidia"],
-                    help="with --backend te on Inkling presets: Thinking Machines-style options (default) "
-                         "or Transformer Engine's default NVFP4 recipe")
+    ap.add_argument("--te-recipe", choices=["tml", "rowscaled", "nvidia"],
+                    help="with --backend te on Inkling presets. tml (default): NVFP4 forward, MXFP8 backward, "
+                         "Four-Over-Six, as published. rowscaled: the same without Four-Over-Six, using only "
+                         "a factory Transformer Engine ships. nvidia: its default NVFP4 recipe.")
     # dense-* presets only
     ap.add_argument("--quant-scope", choices=["all", "mlp"])
     ap.add_argument("--block-size", type=int)
