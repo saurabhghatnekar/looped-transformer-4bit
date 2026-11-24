@@ -12,7 +12,7 @@ from .inkling import Inkling, InklingConfig, param_counts  # noqa: F401
 from .inkling import PRESETS as INKLING_PRESETS
 from .model import Config, LoopedTransformer  # noqa: F401
 from .model import PRESETS as DENSE_PRESETS
-from .nvfp4 import nvfp4_unpack
+from .nvfp4 import mxfp8_unpack, nvfp4_unpack
 
 PRESETS = {**INKLING_PRESETS, **{f"dense-{k}": v for k, v in DENSE_PRESETS.items()}}
 
@@ -51,6 +51,8 @@ def load_checkpoint(path, map_location="cpu"):
         for k, v in ck["tensors"].items():
             if isinstance(v, list):
                 sd[k] = torch.stack([nvfp4_unpack(p) for p in v])
+            elif isinstance(v, dict) and v.get("format") == "mxfp8":
+                sd[k] = mxfp8_unpack(v)
             elif isinstance(v, dict) and "codes" in v:
                 sd[k] = nvfp4_unpack(v)
             else:

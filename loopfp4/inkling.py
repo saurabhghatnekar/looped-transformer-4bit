@@ -95,7 +95,8 @@ class InklingConfig:
     backend: str = "sim"
     te_recipe: str = "tml"                   # "tml" | "rowscaled" | "nvidia", see te_recipe() below
     te_align: int = 32                       # m_splits row alignment for GroupedLinear (TE MXFP8 requires % 32 == 0, NVFP4 % 16 == 0)
-    use_flex_attn: bool = True               # use fused CUDA FlexAttention when seqlen >= 128
+    use_flex_attn: bool = True               # use fused CUDA attention (Triton Flash-RPB+Sink, falling back to FlexAttention) when seqlen >= 128
+    checkpoint_ce: bool = True               # checkpoint chunked cross-entropy backward to save ~13 GB VRAM
 
     def is_global(self, i: int) -> bool:
         return (i + 1) % self.global_every == 0
@@ -276,12 +277,23 @@ def _flex_attn_impl(q, k, v, rel_logits, sinks, block_mask, rel_extent: int):
     return (out.float() * torch.sigmoid(lse.float() - sinks).unsqueeze(-1)).to(v.dtype)
 
 
+_flex_attn_compiled_fn = None
+
+
+def _get_flex_attn_compiled():
+    global _flex_attn_compiled_fn
+    if _flex_attn_compiled_fn is None and flex_attention is not None:
+        if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
+            torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+            if hasattr(torch._dynamo.config, "recompile_limit"):
+                torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+        _flex_attn_compiled_fn = torch.compile(_flex_attn_impl)
+    return _flex_attn_compiled_fn
+
+
 if flex_attention is not None:
-    if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
-        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
-        if hasattr(torch._dynamo.config, "recompile_limit"):
-            torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
-    _flex_attn_compiled = torch.compile(_flex_attn_impl)
+    def _flex_attn_compiled(*args, **kwargs):
+        return _get_flex_attn_compiled()(*args, **kwargs)
 else:
     _flex_attn_compiled = None
 
@@ -410,7 +422,7 @@ class Attention(nn.Module):
             if flex_attention is not None:
                 rel_logits = self.relative_position_bias.logits(q_in, pos)
                 block_mask = _get_block_mask(T, self.window, q_in.device)
-                fn = _flex_attn_impl if torch.compiler.is_compiling() else _flex_attn_compiled
+                fn = _flex_attn_impl if torch.compiler.is_compiling() else _get_flex_attn_compiled()
                 out = fn(q, k, v, rel_logits, sinks, block_mask, self.rel_extent)
                 out = out.transpose(1, 2).reshape(B, T, -1)
                 return self.o_proj(out, q_in)
@@ -892,15 +904,23 @@ class Inkling(nn.Module):
         (used later to choose which experts to prune) and nudges each router's selection bias
         towards an even load: +rate for under-used experts, -rate for over-used ones.
         `sync` sums the counts across processes (pass torch.distributed.all_reduce under DDP)."""
-        for moe in self.moe_blocks():
-            counts = moe.step_counts.clone()
-            if sync is not None:
-                sync(counts)
-            total = counts.sum()
-            if total > 0:
-                moe.usage.mul_(usage_decay).add_(counts / total, alpha=1 - usage_decay)
-                if rate:
-                    moe.gate.e_score_correction_bias.add_(rate * torch.sign(counts.mean() - counts))
+        moes = self.moe_blocks()
+        if not moes:
+            return
+        all_counts = torch.stack([m.step_counts for m in moes])
+        if sync is not None:
+            sync(all_counts)
+        totals = all_counts.sum(dim=-1, keepdim=True)
+        active = totals > 0
+        safe_totals = totals.clamp(min=1.0)
+        means = all_counts.mean(dim=-1, keepdim=True)
+        for i, moe in enumerate(moes):
+            c, a = all_counts[i], active[i]
+            new_usage = moe.usage.mul(usage_decay).add_(c / safe_totals[i], alpha=1 - usage_decay)
+            moe.usage.copy_(torch.where(a, new_usage, moe.usage))
+            if rate:
+                new_bias = moe.gate.e_score_correction_bias + rate * torch.sign(means[i] - c)
+                moe.gate.e_score_correction_bias.copy_(torch.where(a, new_bias, moe.gate.e_score_correction_bias))
             moe.step_counts.zero_()
 
     def _run(self, layer, hidden, block_states, messages, masks, dist, pos):
@@ -930,7 +950,7 @@ class Inkling(nn.Module):
             block_states = torch.cat([block_states, hidden.unsqueeze(-2)], dim=-2)
         return out, block_states
 
-    def forward(self, idx, targets=None, n_loops=None, return_logits: bool = True):
+    def forward(self, idx, targets=None, n_loops=None, return_logits: bool = True, last_only: bool = False):
         cfg = self.cfg
         n_loops = n_loops or cfg.loop_num_passes
         B, T = idx.shape
@@ -988,7 +1008,7 @@ class Inkling(nn.Module):
             total = h_flat.new_zeros((), dtype=torch.float32)
             for s in range(0, h_flat.size(0), chunk):
                 h_c, t_c = h_flat[s : s + chunk], t_flat[s : s + chunk]
-                if self.training and h_c.requires_grad:
+                if self.training and h_c.requires_grad and cfg.checkpoint_ce:
                     total = total + checkpoint(
                         ce_fn, h_c, self.lm_head.weight, t_c, cfg.final_logit_softcapping,
                         use_reentrant=False,
@@ -996,6 +1016,8 @@ class Inkling(nn.Module):
                 else:
                     total = total + ce_fn(h_c, self.lm_head.weight, t_c, cfg.final_logit_softcapping)
             return None, total / t_flat.numel()
+        if targets is None and last_only:
+            hidden = hidden[:, -1:]
         logits = softcap(self.lm_head(hidden).float(), cfg.final_logit_softcapping)
         loss = None
         if targets is not None:
@@ -1005,7 +1027,7 @@ class Inkling(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens: int, temperature: float = 0.8, top_k: int = 50, n_loops=None):
         for _ in range(max_new_tokens):  # no KV cache: recomputes the context every token
-            logits, _ = self(idx[:, -self.cfg.block_size:], n_loops=n_loops)
+            logits, _ = self(idx[:, -self.cfg.block_size:], n_loops=n_loops, last_only=True)
             if temperature == 0:
                 idx = torch.cat([idx, logits[:, -1:].argmax(dim=-1)], dim=1)
                 continue

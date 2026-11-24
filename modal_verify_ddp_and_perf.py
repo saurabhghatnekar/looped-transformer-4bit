@@ -1,4 +1,5 @@
-"""Verify FlexAttention, chunked CE, TE GroupedLinear perf, and 2-GPU NCCL DDP on real B200s.
+"""Historical Part 1 verification harness for FlexAttention, chunked CE, TE GroupedLinear perf, and 2-GPU NCCL DDP.
+For the current Part 2 harness (--backend grouped, Triton RPB+Sink attention, SAC, 2x B200 DDP), see modal_verify_part2.py.
 
 Usage:
     modal run modal_verify_ddp_and_perf.py

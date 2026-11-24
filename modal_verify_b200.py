@@ -1,4 +1,5 @@
-"""Verify loopfp4 end-to-end on a single NVIDIA B200 (sm_100, 180 GB HBM3e) via Modal.
+"""Historical Part 1 verification harness (--backend te) on a single NVIDIA B200 via Modal.
+For the current Part 2 harness (--backend grouped, Triton RPB+Sink attention, SAC), see modal_verify_part2.py.
 
     modal run modal_verify_b200.py
     modal run modal_verify_b200.py --full   # also re-run the 6-min TinyStories smoke e2e CLI pipeline

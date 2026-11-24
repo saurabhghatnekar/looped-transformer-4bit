@@ -7,8 +7,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loopfp4 import Config, LoopedTransformer  # noqa: E402
-from loopfp4.nvfp4 import (QLinear, mxfp8_quantize, nvfp4_pack, nvfp4_quantize, nvfp4_scales,  # noqa: E402
-                           nvfp4_unpack, round_e2m1, round_e4m3, _to_blocks)
+from loopfp4.nvfp4 import (QLinear, mxfp8_pack, mxfp8_quantize, mxfp8_unpack, nvfp4_pack, nvfp4_quantize,  # noqa: E402
+                           nvfp4_scales, nvfp4_unpack, quantize_expert_weight, round_e2m1, round_e4m3,
+                           _to_blocks)
 
 GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 torch.manual_seed(0)
@@ -90,6 +91,16 @@ def test_pack_roundtrip():
     assert p["codes"].dtype == torch.uint8 and p["codes"].numel() == 48 * 208 // 2
     assert p["s_block"].dtype == torch.float8_e4m3fn and p["s_block"].element_size() == 1
     assert torch.equal(nvfp4_unpack(p), nvfp4_quantize(w, "tensor"))  # deployed weights == trained-against weights
+
+    w3 = torch.randn(6, 16, 40) * torch.logspace(-4, 1, 6).view(6, 1, 1)
+    p3 = nvfp4_pack(w3)
+    assert torch.equal(nvfp4_unpack(p3), quantize_expert_weight(w3, "nvfp4"))
+
+    for shape in ((24, 100), (5, 16, 70)):
+        wm = torch.randn(*shape) * 0.05
+        pm = mxfp8_pack(wm)
+        assert pm["codes"].dtype == torch.float8_e4m3fn and pm["exp"].dtype == torch.int8
+        assert torch.equal(mxfp8_unpack(pm), mxfp8_quantize(wm))
 
 
 def test_loops_start_as_identity_and_then_differ():

@@ -232,10 +232,12 @@ _E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
 def nvfp4_pack(w: torch.Tensor) -> dict:
-    """Pack a 2-D weight into NVFP4: uint8 nibble pairs, float8_e4m3fn block scales, FP32 global."""
+    """Pack a 2-D or 3-D weight into NVFP4: uint8 nibble pairs, float8_e4m3fn block scales, FP32 global."""
+    assert w.dim() in (2, 3), f"expected 2-D or 3-D weight, got {w.shape}"
     w = w.detach().float().cpu()
-    xb, pad = _to_blocks(w, NVFP4_BLOCK)
-    s_block, s_global = nvfp4_scales(xb, "tensor", FP4_MAX)
+    xb, _ = _to_blocks(w, NVFP4_BLOCK)
+    outer = "lead" if w.dim() == 3 else "tensor"
+    s_block, s_global = nvfp4_scales(xb, outer, FP4_MAX)
     scale = s_block * s_global
     safe = torch.where(scale > 0, scale, torch.ones_like(scale))
     q = round_e2m1(xb / safe)
@@ -245,9 +247,10 @@ def nvfp4_pack(w: torch.Tensor) -> dict:
         codes = torch.cat([codes, codes.new_zeros(1)])
     packed = codes[0::2] | (codes[1::2] << 4)
     return {
+        "format": "nvfp4",
         "codes": packed,
         "s_block": s_block.squeeze(-1).to(torch.float8_e4m3fn).contiguous(),  # 1 byte per 16 values
-        "s_global": s_global.reshape(1),
+        "s_global": s_global.reshape(-1).contiguous(),
         "shape": torch.tensor(w.shape),
     }
 
@@ -255,10 +258,41 @@ def nvfp4_pack(w: torch.Tensor) -> dict:
 def nvfp4_unpack(p: dict) -> torch.Tensor:
     shape = [int(s) for s in p["shape"]]
     padded = shape[-1] + ((-shape[-1]) % NVFP4_BLOCK)
-    n = shape[0] * padded
+    if len(shape) == 3:
+        n = shape[0] * shape[1] * padded
+        sg_shape = (shape[0], 1, 1, 1)
+    else:
+        n = shape[0] * padded
+        sg_shape = (1, 1, 1)
     codes = torch.stack([p["codes"] & 0xF, p["codes"] >> 4], dim=1).reshape(-1)[:n].long()
     mag = _E2M1_GRID[codes & 0x7]
-    q = torch.where((codes >> 3) == 1, -mag, mag).reshape(shape[0], -1, NVFP4_BLOCK)
+    q = torch.where((codes >> 3) == 1, -mag, mag).reshape(*shape[:-1], -1, NVFP4_BLOCK)
     s_block = p["s_block" if "s_block" in p else "s_block_e4m3"].float()
-    w = q * (s_block.unsqueeze(-1) * p["s_global"].float())
-    return w.reshape(shape[0], padded)[:, : shape[-1]]
+    s_global = p["s_global"].float().reshape(sg_shape)
+    w = q * (s_block.unsqueeze(-1) * s_global)
+    return w.reshape(*shape[:-1], padded)[..., : shape[-1]]
+
+
+def mxfp8_pack(w: torch.Tensor) -> dict:
+    """Pack a 2-D or 3-D weight into MXFP8: float8_e4m3fn codes + int8 exponent per 32 values."""
+    assert w.dim() in (2, 3), f"expected 2-D or 3-D weight, got {w.shape}"
+    w = w.detach().float().cpu()
+    xb, _ = _to_blocks(w, MXFP8_BLOCK)
+    amax = xb.abs().amax(dim=-1, keepdim=True).clamp(min=_TINY)
+    k = torch.ceil(torch.log2(amax / E4M3_MAX)).clamp(min=-127.0, max=127.0)
+    scale = torch.pow(2.0, k)
+    v = xb / scale
+    q = torch.copysign(round_e4m3(v.abs(), False), v)
+    return {
+        "format": "mxfp8",
+        "codes": q.to(torch.float8_e4m3fn).contiguous(),
+        "exp": k.squeeze(-1).to(torch.int8).contiguous(),
+        "shape": torch.tensor(w.shape),
+    }
+
+
+def mxfp8_unpack(p: dict) -> torch.Tensor:
+    shape = [int(s) for s in p["shape"]]
+    scale = torch.pow(2.0, p["exp"].float()).unsqueeze(-1)
+    w = p["codes"].float() * scale
+    return w.reshape(*shape[:-1], -1)[..., : shape[-1]]

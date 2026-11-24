@@ -5,7 +5,8 @@ Laptop check (CPU / Apple MPS), Inkling 2 Mini's architecture at ~10M parameters
 
 One Blackwell node, 8 GPUs, the same architecture at ~5B parameters:
     torchrun --nproc_per_node=8 train.py --preset 5b --data /data/fineweb-edu-100b-inkling --out runs/5b \
-        --batch-size 4 --grad-accum 4 --steps 380000 --lr 2e-4 --warmup 3000
+        --backend grouped --grad-checkpoint-mode sac --compile --batch-size 32 --grad-accum 1 \
+        --steps 380000 --lr 2e-4 --warmup 3000
 
 Continue from a pruned checkpoint (see prune_experts.py):
     python train.py --init runs/5b/pruned.pt --data ... --out runs/5b-healed
@@ -14,6 +15,7 @@ Continue from a pruned checkpoint (see prune_experts.py):
 import argparse
 import contextlib
 import dataclasses
+import inspect
 import json
 import math
 import os
@@ -59,6 +61,8 @@ def parse():
     ap.add_argument("--quant-scope", choices=["all", "mlp"])
     ap.add_argument("--block-size", type=int)
     ap.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--checkpoint-ce", action=argparse.BooleanOptionalAction, default=None,
+                    help="checkpoint chunked cross-entropy backward (disable with --no-checkpoint-ce if VRAM allows)")
     # optimisation
     ap.add_argument("--batch-size", type=int, default=32, help="sequences per GPU per micro-step")
     ap.add_argument("--grad-accum", type=int, default=1)
@@ -69,7 +73,10 @@ def parse():
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--prefetch", type=int, default=0, help="background CPU batch prefetch queue depth")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--ddp-bf16-grads", action="store_true",
+                    help="compress DDP gradient all-reduce to BF16 via DDP comm hook")
     # logging
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--eval-every", type=int, default=250)
@@ -122,7 +129,8 @@ def main():
         padded_vocab = args.vocab_size or (cfg.vocab_size if vocab == cfg.unpadded_vocab_size else vocab)
         overrides.update(vocab_size=padded_vocab, unpadded_vocab_size=vocab, loop_num_passes=args.loops,
                          n_routed_experts=args.experts, backward=args.backward, te_recipe=args.te_recipe,
-                         te_align=args.te_align, grad_checkpoint_mode=args.grad_checkpoint_mode)
+                         te_align=args.te_align, grad_checkpoint_mode=args.grad_checkpoint_mode,
+                         checkpoint_ce=args.checkpoint_ce)
     else:
         overrides.update(vocab_size=vocab, n_loops=args.loops, quant_scope=args.quant_scope)
     if overrides["backend"] in ("te", "grouped") and not torch.cuda.is_available():
@@ -149,7 +157,10 @@ def main():
             if cfg.backend == "te":
                 bdetail = f"te_recipe={cfg.te_recipe}"
             elif cfg.backend == "grouped":
-                bdetail = f"gc_mode={cfg.grad_checkpoint_mode}"
+                if args.backward == "mxfp8":
+                    print("warning: --backend grouped runs exact BF16 autograd backward; "
+                          "--backward mxfp8 applies to --backend sim only", flush=True)
+                bdetail = f"gc_mode={cfg.grad_checkpoint_mode} backward=exact"
             else:
                 bdetail = f"backward={cfg.backward}"
             detail += f" experts={cfg.num_experts_per_tok}/{cfg.n_routed_experts} {bdetail}"
@@ -175,13 +186,15 @@ def main():
         step = ck["step"]
         rngs = ck.get("data_rngs")
         if rngs and rank < len(rngs):
-            train.rng.bit_generator.state = rngs[rank]
+            train.set_rng_state(rngs[rank])
         else:
             train.rng.bit_generator.advance(step * args.grad_accum * (args.batch_size + 2))
         if "loop_rng" in ck:
             loop_rng.set_state(ck["loop_rng"].cpu())
         if master:
             print(f"resumed from step {step}", flush=True)
+    if args.prefetch > 0:
+        train.start_prefetch(args.prefetch)
     is_fresh_init = bool(args.init and not resuming)
     del ck
 
@@ -197,7 +210,15 @@ def main():
         else:
             model = torch.compile(model)
     if ddp:
-        model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], broadcast_buffers=False)
+        ddp_kw = {"device_ids": [int(os.environ.get("LOCAL_RANK", 0))]}
+        if "forward_sync_buffers" in inspect.signature(DDP.__init__).parameters:
+            ddp_kw["forward_sync_buffers"] = False
+        else:
+            ddp_kw["broadcast_buffers"] = False
+        model = DDP(model, **ddp_kw)
+        if args.ddp_bf16_grads:
+            from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
+            model.register_comm_hook(state=None, hook=bf16_compress_hook)
 
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if device.startswith("cuda") else contextlib.nullcontext()
     if not ink and cfg.backend == "te" and cfg.quant == "nvfp4":
@@ -220,10 +241,12 @@ def main():
         return tot / args.eval_batches
 
     def save(data_rngs):
+        tmp_path = ckpt_path + ".tmp"
         torch.save({"model": get_state(raw), "opt": opt.state_dict(), "step": step,
                     "arch": "inkling" if ink else "dense", "config": raw.config_dict(), "args": vars(args),
                     "data_rngs": data_rngs, "loop_rng": loop_rng.get_state()},
-                   ckpt_path)
+                   tmp_path)
+        os.replace(tmp_path, ckpt_path)
 
     log = open(os.path.join(args.out, "log.jsonl"), "a") if master else None
     if master and is_fresh_init:  # where the loaded weights start from, e.g. the loss right after pruning
@@ -285,14 +308,15 @@ def main():
                 torch.distributed.barrier()
             t0, last = time.time(), step
         if step % args.save_every == 0 or step == args.steps:
-            data_rngs = [None] * world if ddp else [train.rng.bit_generator.state]
+            data_rngs = [None] * world if ddp else [train.rng_state()]
             if ddp:
-                torch.distributed.all_gather_object(data_rngs, train.rng.bit_generator.state)
+                torch.distributed.all_gather_object(data_rngs, train.rng_state())
             if master:
                 save(data_rngs)
             if ddp:
                 torch.distributed.barrier()
 
+    train.close()
     if ddp:
         torch.distributed.destroy_process_group()
 

@@ -201,7 +201,7 @@ class LoopedTransformer(nn.Module):
             return ckpt_fn(blk, x, cos, sin, use_reentrant=False)
         return blk(x, cos, sin)
 
-    def forward(self, idx, targets=None, n_loops=None, return_logits: bool = True):
+    def forward(self, idx, targets=None, n_loops=None, return_logits: bool = True, last_only: bool = False):
         cfg = self.cfg
         n_loops = n_loops or cfg.n_loops
         T = idx.shape[1]
@@ -252,6 +252,8 @@ class LoopedTransformer(nn.Module):
                 else:
                     total = total + _ce_chunk(h_c, t_c)
             return None, total / t_flat.numel()
+        if targets is None and last_only:
+            hidden = hidden[:, -1:]
         logits = self.head(hidden)
         loss = None
         if targets is not None:
@@ -261,7 +263,7 @@ class LoopedTransformer(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens: int, temperature: float = 0.8, top_k: int = 50, n_loops=None):
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.cfg.block_size:], n_loops=n_loops)
+            logits, _ = self(idx[:, -self.cfg.block_size:], n_loops=n_loops, last_only=True)
             if temperature == 0:
                 idx = torch.cat([idx, logits[:, -1:].argmax(dim=-1)], dim=1)
                 continue

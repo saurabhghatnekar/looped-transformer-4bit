@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--gpu-gb", type=float, default=180, help="ASSUMED usable memory per GPU")
     ap.add_argument("--tok-per-s-per-gpu", type=float, default=0, help="measured throughput; overrides the two above")
     ap.add_argument("--usd-per-gpu-hour", type=float, default=4.0, help="ASSUMED rental price")
+    ap.add_argument("--grad-checkpoint-mode", choices=["layer", "sac", "none"], default=None,
+                    help="activation checkpointing mode for training FLOPs estimate (default: from preset)")
     args = ap.parse_args()
 
     cfg = dataclasses.replace(PRESETS[args.preset])
@@ -67,7 +69,15 @@ def main():
     if args.experts and ink:
         cfg.n_routed_experts = args.experts
     s = size_inkling(cfg) if ink else size_dense(cfg)
-    flops_mult = 8 if cfg.grad_checkpoint else 6        # 2 fwd (+ 2 recompute if checkpointed) + 4 bwd
+    gc_mode = args.grad_checkpoint_mode
+    if gc_mode is None:
+        if not cfg.grad_checkpoint:
+            gc_mode = "none"
+        elif ink and cfg.grad_checkpoint_mode in ("sac", "sac_all"):
+            gc_mode = "sac"
+        else:
+            gc_mode = "layer"
+    flops_mult = {"none": 6, "sac": 7, "layer": 8}[gc_mode]
     flops_per_token = flops_mult * s["applied"]
     state_gb = s["stored"] * 16 / 1e9
 
@@ -76,7 +86,11 @@ def main():
     print(f"  active per token         {s['active'] / 1e9:8.3f} B   (one pass; what the model card calls 'active')")
     print(f"  layer applications/token {s['applications']:8d}   (non-looped would be {s['layers']})")
     print(f"  weights applied/token    {s['applied'] / 1e9:8.3f} B   (looped layers counted once per pass)")
-    ckpt_note = "  (includes activation-checkpoint recompute)" if cfg.grad_checkpoint else ""
+    ckpt_note = {
+        "none": "",
+        "sac": "  (SAC: saves attention + linear mm, recomputes MoE/elementwise)",
+        "layer": "  (includes activation-checkpoint recompute)",
+    }[gc_mode]
     print(f"  training FLOPs/token     {flops_per_token:8.2e}{ckpt_note}")
     print(f"  deployed checkpoint      {s['ckpt'] / 1e9:8.2f} GB  ({s['formats']})")
     print(f"  training weight state    {state_gb:8.1f} GB  (FP32 weights + grads + two Adam moments), before activations")

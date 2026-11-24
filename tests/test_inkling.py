@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loopfp4 import PRESETS, Inkling, InklingConfig, param_counts  # noqa: E402
 from loopfp4.inkling import (BlockAttentionResidual, DynamicShortConvolution,  # noqa: E402
                              ShortConvolution, rms_norm, softcap)
-from loopfp4.nvfp4 import (mxfp8_quantize, nvfp4_quantize, qgemm, quantize_act, quantize_expert_weight,  # noqa: E402
+from loopfp4.nvfp4 import (mxfp8_quantize, nvfp4_pack, nvfp4_quantize, qgemm, quantize_act, quantize_expert_weight,  # noqa: E402
                            round_e4m3)
 
 torch.manual_seed(0)
@@ -362,14 +362,24 @@ def test_bfloat16_autocast_and_export_roundtrip():
         unpacked.eval()
         assert torch.equal(quantize_expert_weight(model.layers[0].mlp.experts.gate_up_proj, "nvfp4"),
                            unpacked.layers[0].mlp.experts.gate_up_proj)
-        sd_bf16 = {k: (v.bfloat16().float() if v.is_floating_point() and not (".mlp.experts." in k and any(f"layers.{i}." in k for i in range(6))) else v)
+        assert torch.equal(quantize_expert_weight(model.layers[7].mlp.experts.gate_up_proj, "mxfp8"),
+                           unpacked.layers[7].mlp.experts.gate_up_proj)
+        sd_bf16 = {k: (v.bfloat16().float() if v.is_floating_point() and ".mlp.experts." not in k else v)
                    for k, v in model.state_dict().items()}
         with torch.no_grad():
             raw_logits = model(idx[:, :-1])[0]
             unpacked_logits = unpacked(idx[:, :-1])[0]
-            assert torch.allclose(raw_logits, unpacked_logits, atol=1e-1)  # BF16 rounding noise on non-FP4 weights
+            assert torch.allclose(raw_logits, unpacked_logits, atol=1e-1)  # BF16 rounding noise on non-expert weights
             model.load_state_dict(sd_bf16)
             assert torch.allclose(model(idx[:, :-1])[0], unpacked_logits, atol=1e-5)  # zero packing error
+        # Backward compatibility: legacy list[dict] expert container format still loads
+        legacy = torch.load(exp_path, map_location="cpu")
+        w0 = model.layers[0].mlp.experts.gate_up_proj
+        legacy["tensors"]["layers.0.mlp.experts.gate_up_proj"] = [nvfp4_pack(w0[e]) for e in range(w0.shape[0])]
+        legacy_path = os.path.join(tmp, "legacy.pt")
+        torch.save(legacy, legacy_path)
+        legacy_model, _ = load_checkpoint(legacy_path)
+        assert torch.equal(legacy_model.layers[0].mlp.experts.gate_up_proj, unpacked.layers[0].mlp.experts.gate_up_proj)
         broken = torch.load(exp_path, map_location="cpu")
         del broken["tensors"]["lm_head.weight"]
         torch.save(broken, exp_path)
@@ -476,6 +486,126 @@ def test_grouped_canonical_roundtrip():
     idx = torch.randint(0, 64, (2, 24))
     with torch.no_grad():
         assert torch.allclose(grp(idx)[0], sim(idx)[0], atol=1e-5)
+
+
+def test_balance_step_stacked_single_sync_and_zero_layer():
+    model = Inkling(InklingConfig(**TINY)).train()
+    moes = model.moe_blocks()
+    with torch.no_grad():
+        for i, moe in enumerate(moes):
+            if i != 1:
+                moe.step_counts.copy_(torch.arange(moe.step_counts.numel(), dtype=torch.float32) + (i + 1))
+            moe.usage.fill_(0.25)
+            moe.gate.e_score_correction_bias.fill_(0.125)
+    orig_usage_zero = moes[1].usage.clone()
+    orig_bias_zero = moes[1].gate.e_score_correction_bias.clone()
+
+    calls = []
+
+    def sync_once(t):
+        calls.append(tuple(t.shape))
+        t.mul_(2.0)
+
+    model.balance_step(rate=0.01, sync=sync_once)
+    assert calls == [(len(moes), TINY["n_routed_experts"])]
+    assert torch.equal(moes[1].usage, orig_usage_zero)
+    assert torch.equal(moes[1].gate.e_score_correction_bias, orig_bias_zero)
+    c0 = (torch.arange(TINY["n_routed_experts"], dtype=torch.float32) + 1) * 2.0
+    want_u0 = orig_usage_zero * 0.99 + (c0 / c0.sum()) * 0.01
+    want_b0 = orig_bias_zero + 0.01 * torch.sign(c0.mean() - c0)
+    assert torch.allclose(moes[0].usage, want_u0, atol=1e-6)
+    assert torch.allclose(moes[0].gate.e_score_correction_bias, want_b0, atol=1e-6)
+    assert all(m.step_counts.sum().item() == 0 for m in moes)
+
+
+def test_last_only_and_checkpoint_ce_flag():
+    from loopfp4 import Config, LoopedTransformer
+
+    ink = randomise(Inkling(InklingConfig(**TINY, backward="exact", grad_checkpoint=False, checkpoint_ce=True))).train()
+    no_ckpt_ce = Inkling(InklingConfig(**TINY, backward="exact", grad_checkpoint=False, checkpoint_ce=False)).train()
+    no_ckpt_ce.load_canonical(ink.canonical_state_dict())
+
+    idx = torch.randint(0, 64, (2, 25))
+    _, loss_a = ink(idx[:, :-1], idx[:, 1:], return_logits=False)
+    _, loss_b = no_ckpt_ce(idx[:, :-1], idx[:, 1:], return_logits=False)
+    assert torch.allclose(loss_a, loss_b, atol=1e-5)
+    loss_a.backward()
+    loss_b.backward()
+    for (n, pa), (_, pb) in zip(ink.named_parameters(), no_ckpt_ce.named_parameters()):
+        assert torch.allclose(pa.grad, pb.grad, atol=1e-5), n
+
+    ink.eval()
+    with torch.no_grad():
+        full_l, _ = ink(idx[:, :-1])
+        last_l, _ = ink(idx[:, :-1], last_only=True)
+        assert last_l.shape == (2, 1, TINY["unpadded_vocab_size"])
+        assert torch.allclose(last_l, full_l[:, -1:], atol=1e-5)
+
+    dense = LoopedTransformer(Config(vocab_size=64, d_model=64, n_head=4, n_prelude=1, n_loop=2, n_coda=1, block_size=24)).eval()
+    with torch.no_grad():
+        dl_full, _ = dense(idx[:, :-1])
+        dl_last, _ = dense(idx[:, :-1], last_only=True)
+        assert dl_last.shape == (2, 1, 64)
+        assert torch.allclose(dl_last, dl_full[:, -1:], atol=1e-5)
+
+
+def test_shard_data_prefetch_determinism():
+    import json
+    import tempfile
+    import numpy as np
+    from loopfp4.data import ShardData
+
+    with tempfile.TemporaryDirectory() as tmp:
+        rng = np.random.default_rng(123)
+        for s in range(2):
+            arr = rng.integers(0, 64, size=512, dtype=np.uint16)
+            arr.tofile(os.path.join(tmp, f"train_{s:05d}.bin"))
+        with open(os.path.join(tmp, "meta.json"), "w") as f:
+            json.dump({"dtype": "uint16", "vocab_size": 64}, f)
+
+        d_sync = ShardData(tmp, "train", block_size=16, batch_size=4, device="cpu", seed=99, prefetch=0)
+        d_pref = ShardData(tmp, "train", block_size=16, batch_size=4, device="cpu", seed=99, prefetch=2)
+        saved_state = None
+        for step in range(6):
+            xs, ys = d_sync.batch()
+            xp, yp = d_pref.batch()
+            assert torch.equal(xs, xp) and torch.equal(ys, yp), step
+            if step == 2:
+                saved_state = d_pref.rng_state()
+                assert len(saved_state["state"]) >= 0
+
+        # Next batch from uninterrupted sync run vs freshly resumed prefetch run at step 2
+        d_sync2 = ShardData(tmp, "train", block_size=16, batch_size=4, device="cpu", seed=99, prefetch=0)
+        for _ in range(3):
+            d_sync2.batch()
+        want_x, want_y = d_sync2.batch()
+
+        d_resumed = ShardData(tmp, "train", block_size=16, batch_size=4, device="cpu", seed=777, prefetch=0)
+        d_resumed.set_rng_state(saved_state)
+        d_resumed.start_prefetch(2)
+        got_x, got_y = d_resumed.batch()
+        assert torch.equal(got_x, want_x) and torch.equal(got_y, want_y)
+        d_pref.close()
+        d_resumed.close()
+
+
+def test_cuda_triton_and_grouped_parity():
+    if not torch.cuda.is_available():
+        return
+    sim = randomise(Inkling(InklingConfig(**TINY, block_size=128, sliding_window_size=64, rel_extent=64,
+                                          backward="exact", backend="sim", grad_checkpoint=False))).cuda().train()
+    grp = Inkling(InklingConfig(**TINY, block_size=128, sliding_window_size=64, rel_extent=64,
+                                 backward="exact", backend="grouped", grad_checkpoint=True,
+                                 grad_checkpoint_mode="sac")).cuda().train()
+    grp.load_canonical(sim.canonical_state_dict())
+    idx = torch.randint(0, 64, (2, 129), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        _, ls = sim(idx[:, :-1], idx[:, 1:], return_logits=False)
+        _, lg = grp(idx[:, :-1], idx[:, 1:], return_logits=False)
+    assert torch.allclose(ls.float(), lg.float(), atol=5e-2), (ls.item(), lg.item())
+    ls.backward()
+    lg.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in grp.parameters())
 
 
 if __name__ == "__main__":
