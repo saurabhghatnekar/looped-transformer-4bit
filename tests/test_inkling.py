@@ -12,7 +12,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from loopfp4 import PRESETS, Inkling, InklingConfig, param_counts  # noqa: E402
-from loopfp4.inkling import softcap  # noqa: E402
+from loopfp4.inkling import (BlockAttentionResidual, DynamicShortConvolution,  # noqa: E402
+                             ShortConvolution, rms_norm, softcap)
 from loopfp4.nvfp4 import (mxfp8_quantize, nvfp4_quantize, qgemm, quantize_act, quantize_expert_weight,  # noqa: E402
                            round_e4m3)
 
@@ -377,6 +378,104 @@ def test_bfloat16_autocast_and_export_roundtrip():
             assert False, "expected missing weight in exported file to fail"
         except RuntimeError:
             pass
+
+
+def test_fast_convs_and_attn_res_exact():
+    import math
+    torch.manual_seed(7)
+    sc = ShortConvolution(32, 4)
+    with torch.no_grad():
+        sc.conv1d.weight.normal_(std=0.2)
+    x1 = torch.randn(2, 16, 32, requires_grad=True)
+    x2 = x1.detach().clone().requires_grad_(True)
+    g = torch.randn_like(x1)
+    y_got = sc(x1)
+    (y_got * g).sum().backward()
+    dw_got = sc.conv1d.weight.grad.clone()
+    sc.zero_grad()
+
+    y_ref = F.conv1d(x2.transpose(1, 2), sc.conv1d.weight.float(), padding=3, groups=32)[..., :16].transpose(1, 2)
+    y_ref = (y_ref + x2) / math.sqrt(5)
+    (y_ref * g).sum().backward()
+    assert torch.allclose(y_got, y_ref, atol=1e-5)
+    assert torch.allclose(x1.grad, x2.grad, atol=1e-5)
+    assert torch.allclose(dw_got, sc.conv1d.weight.grad, atol=1e-5)
+
+    dsc = DynamicShortConvolution(32, 48, heads=4, kernel=4)
+    with torch.no_grad():
+        dsc.static_weight.normal_(std=0.2)
+        dsc.weight_proj.weight.normal_(std=0.2)
+    dx1 = torch.randn(2, 16, 32, requires_grad=True)
+    dyn1 = torch.randn(2, 16, 48, requires_grad=True)
+    dx2, dyn2 = dx1.detach().clone().requires_grad_(True), dyn1.detach().clone().requires_grad_(True)
+    dy_got = dsc(dx1, dyn1)
+    (dy_got * g).sum().backward()
+    g_dx1, g_dyn1 = dx1.grad.clone(), dyn1.grad.clone()
+    g_sw1, g_wp1 = dsc.static_weight.grad.clone(), dsc.weight_proj.weight.grad.clone()
+    dsc.zero_grad()
+
+    dyn = dsc.weight_proj(dyn2).float().view(2, 16, 4, 1, 4)
+    weights = dsc.static_weight.float().T.reshape(4, -1, 4) + dyn
+    ctx = F.pad(dx2.transpose(1, 2), (3, 0))
+    windows = ctx.unfold(-1, 4, 1).flip(-1).transpose(1, 2).reshape(2, 16, 4, -1, 4)
+    dy_ref = ((windows * weights).sum(-1).reshape(2, 16, 32) + dx2) / math.sqrt(9)
+    (dy_ref * g).sum().backward()
+    assert torch.allclose(dy_got, dy_ref, atol=1e-5)
+    assert torch.allclose(g_dx1, dx2.grad, atol=1e-5)
+    assert torch.allclose(g_dyn1, dyn2.grad, atol=1e-5)
+    assert torch.allclose(g_sw1, dsc.static_weight.grad, atol=1e-5)
+    assert torch.allclose(g_wp1, dsc.weight_proj.weight.grad, atol=1e-5)
+
+    for nq in (1, 3):
+        bar = BlockAttentionResidual(InklingConfig(**TINY), num_queries=nq)
+        with torch.no_grad():
+            bar.query.normal_(std=0.3)
+        bs1 = torch.randn(2, 12, 3, 64, requires_grad=True)
+        pt1 = torch.randn(2, 12, 64, requires_grad=True)
+        bs2, pt2 = bs1.detach().clone().requires_grad_(True), pt1.detach().clone().requires_grad_(True)
+        gm = torch.randn(2, 12, nq, 64)
+        out_got = bar(bs1, pt1)
+        (out_got * gm).sum().backward()
+        g_q1, g_bs1, g_pt1 = bar.query.grad.clone(), bs1.grad.clone(), pt1.grad.clone()
+        bar.zero_grad()
+
+        states = rms_norm(torch.cat([bs2, pt2.unsqueeze(-2)], dim=-2).float(), bar.eps)
+        attn = F.softmax(torch.einsum("qh,btsh->btqs", bar.query.float().view(-1, 64), states) * 64**-0.5, dim=-1)
+        out_ref = attn @ states
+        (out_ref * gm).sum().backward()
+        assert torch.allclose(out_got, out_ref, atol=1e-5), nq
+        assert torch.allclose(g_q1, bar.query.grad, atol=1e-5), nq
+        assert torch.allclose(g_bs1, bs2.grad, atol=1e-5), nq
+        assert torch.allclose(g_pt1, pt2.grad, atol=1e-5), nq
+
+
+def test_grad_checkpoint_mlp_mode():
+    torch.manual_seed(11)
+    ref = randomise(Inkling(InklingConfig(**TINY, backward="exact", grad_checkpoint=False))).train()
+    idx = torch.randint(0, 64, (2, 25))
+    _, loss_ref = ref(idx[:, :-1], idx[:, 1:], return_logits=False)
+    loss_ref.backward()
+    for mode in ("mlp", "half", "sac", "sac_all"):
+        ckpt_m = Inkling(
+            InklingConfig(**TINY, backward="exact", grad_checkpoint=True, grad_checkpoint_mode=mode)
+        ).train()
+        ckpt_m.load_canonical(ref.canonical_state_dict())
+        _, loss_got = ckpt_m(idx[:, :-1], idx[:, 1:], return_logits=False)
+        assert torch.allclose(loss_got, loss_ref, atol=1e-5), mode
+        loss_got.backward()
+        for (n, p_ref), (_, p_got) in zip(ref.named_parameters(), ckpt_m.named_parameters()):
+            assert p_got.grad is not None and torch.isfinite(p_got.grad).all(), (mode, n)
+            assert torch.allclose(p_got.grad, p_ref.grad, atol=1e-5), (mode, n)
+
+
+def test_grouped_canonical_roundtrip():
+    sim = randomise(Inkling(InklingConfig(**TINY, backward="exact", backend="sim"))).eval()
+    grp = Inkling(InklingConfig(**TINY, backward="exact", backend="grouped")).eval()
+    assert set(grp.canonical_state_dict()) == set(sim.state_dict())
+    grp.load_canonical(sim.canonical_state_dict())
+    idx = torch.randint(0, 64, (2, 24))
+    with torch.no_grad():
+        assert torch.allclose(grp(idx)[0], sim(idx)[0], atol=1e-5)
 
 
 if __name__ == "__main__":

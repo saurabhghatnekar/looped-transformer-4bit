@@ -43,9 +43,13 @@ def parse():
     ap.add_argument("--backward", choices=["mxfp8", "exact"], help="precision of the expert backward GEMMs")
     ap.add_argument("--balance-rate", type=float, default=1e-3,
                     help="step size of the router's load-balancing bias; 0 turns balancing off")
-    ap.add_argument("--backend", choices=["sim", "te"],
-                    help="sim: 4-bit numerics simulated, runs anywhere. te: native NVFP4 GEMMs through "
-                         "NVIDIA Transformer Engine, Blackwell only. Default sim.")
+    ap.add_argument("--backend", choices=["sim", "te", "grouped"],
+                    help="sim: 4-bit numerics simulated, runs anywhere. te: NVIDIA Transformer Engine "
+                         "GroupedLinear, Blackwell only. grouped: zero-sync torch._grouped_mm, CUDA.")
+    ap.add_argument("--grad-checkpoint-mode", choices=["layer", "half", "sac", "sac_all", "mlp"],
+                    help="when grad-checkpoint is enabled on Inkling: 'layer' recomputes the whole "
+                         "DecoderLayer, 'half' alternates layer/mlp, 'sac' saves Triton attn+mm, "
+                         "'sac_all' saves attn+mm+grouped_mm, 'mlp' recomputes MoE only.")
     ap.add_argument("--te-recipe", choices=["tml", "rowscaled", "nvidia"],
                     help="with --backend te on Inkling presets. tml (default): NVFP4 forward, MXFP8 backward, "
                          "Four-Over-Six, as published. rowscaled: the same without Four-Over-Six, using only "
@@ -118,11 +122,11 @@ def main():
         padded_vocab = args.vocab_size or (cfg.vocab_size if vocab == cfg.unpadded_vocab_size else vocab)
         overrides.update(vocab_size=padded_vocab, unpadded_vocab_size=vocab, loop_num_passes=args.loops,
                          n_routed_experts=args.experts, backward=args.backward, te_recipe=args.te_recipe,
-                         te_align=args.te_align)
+                         te_align=args.te_align, grad_checkpoint_mode=args.grad_checkpoint_mode)
     else:
         overrides.update(vocab_size=vocab, n_loops=args.loops, quant_scope=args.quant_scope)
-    if overrides["backend"] == "te" and not torch.cuda.is_available():
-        raise SystemExit("--backend te needs a Blackwell GPU and NVIDIA Transformer Engine; use --backend sim here")
+    if overrides["backend"] in ("te", "grouped") and not torch.cuda.is_available():
+        raise SystemExit(f"--backend {overrides['backend']} needs CUDA; use --backend sim here")
     for field, val in overrides.items():
         if val is not None:
             setattr(cfg, field, val)
@@ -142,8 +146,13 @@ def main():
         os.makedirs(args.out, exist_ok=True)
         detail = f"backend={cfg.backend}"
         if ink:
-            detail += f" experts={cfg.num_experts_per_tok}/{cfg.n_routed_experts} " + (
-                f"te_recipe={cfg.te_recipe}" if cfg.backend == "te" else f"backward={cfg.backward}")
+            if cfg.backend == "te":
+                bdetail = f"te_recipe={cfg.te_recipe}"
+            elif cfg.backend == "grouped":
+                bdetail = f"gc_mode={cfg.grad_checkpoint_mode}"
+            else:
+                bdetail = f"backward={cfg.backward}"
+            detail += f" experts={cfg.num_experts_per_tok}/{cfg.n_routed_experts} {bdetail}"
         print(f"device={device} world={world} params={raw.num_params() / 1e6:.2f}M "
               f"applications={cfg.applications()} quant={cfg.quant} {detail}", flush=True)
 
@@ -177,7 +186,16 @@ def main():
     del ck
 
     if args.compile:
-        model = torch.compile(model)
+        if ink:
+            if ddp and hasattr(torch, "_dynamo"):
+                # Each DecoderLayer is already compiled individually across 48 layer applications,
+                # so DDP autograd hooks overlap communication between layers without DDPOptimizer
+                # splitting intra-layer FX graphs (which strips SAC ac_graph_id metadata in PyTorch 2.15).
+                torch._dynamo.config.optimize_ddp = False
+            for layer in raw.layers:
+                layer.compile()
+        else:
+            model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))], broadcast_buffers=False)
 

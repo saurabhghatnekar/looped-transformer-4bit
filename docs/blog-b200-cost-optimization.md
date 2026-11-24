@@ -1,9 +1,11 @@
-# How to Cut a 100B-Token 5B MoE Run from \$100k+ Toward \$2k–\$4k on NVIDIA B200s
-### *Part 1: Achieving a Verified 2.66x Speedup (1,412 → 3,756 tok/s/B200) and Root-Causing the 5.5x Transformer Engine MoE Wall*
+# Cutting a 100B-Token 5B MoE Run from \$100k+ Down to \$4.8k–\$5.1k on NVIDIA B200s (And the Path to \$2k–\$4k)
+### *Part 1 & Part 2: A Verified 16.4x End-to-End Speedup (1,412 → 23,175 tok/s/B200) and 41.5k tok/s on 2x B200 DDP*
 
-> **Engineering honesty upfront:** This post splits cleanly into **what is already measured and verified on real NVIDIA B200s** versus **what is root-caused and benchmarked as the blueprint for Part 2**.
-> - **Completed & verified on B200 hardware:** We took the `5b` Inkling-style looped MoE model (`5.403B` stored / `0.873B` active per pass / `48` layer-applications per token) from **`1,412 tok/s/B200`** (`145.52 GB` peak VRAM → **\$78,691** at \$4/GPU-hr, or **\$100k+** at smaller batches or \$5–\$6/hr cloud pricing) up to **`3,756 tok/s/B200`** (`115.71 GB` peak VRAM → **\$29,582**) — a **2.66x end-to-end speedup** and **-46 GB peak VRAM reduction** at `bs=8x2048` with zero numeric approximations (`1e-6` IEEE FP32 attention parity, `0.0` chunked cross-entropy loss diff). We also verified real multi-GPU `2x B200` NCCL DDP with checkpoint save/resume and live `FineWeb-Edu` streaming data prep.
-> - **Root-caused & benchmarked blueprint (not yet `30k–60k tok/s`):** Even after making attention `2.74x` faster (`8.70 ms`), full-step utilization sits at **`1.51%` of B200 BF16 peak** (`33.88 TFLOPS` effective). Inspecting NVIDIA Transformer Engine `2.20.2`'s `GroupedLinear` source and running isolated MoE benchmarks on B200 revealed the exact culprit: TE's `is_module_grouped_tensor_path_supported()` explicitly disables its fused `GroupedTensor` GEMM path for *any* `CustomRecipe` (`tml`, `rowscaled`), forcing every layer into a per-expert Python loop (`49.93 ms`). Swapping just the expert GEMMs to PyTorch's native `torch._grouped_mm` in BF16 drops single-layer MoE time to **`9.01 ms` (`5.54x` faster)** — proving the path to **`30k–60k tok/s/B200`** (**\$1,852–\$3,704** for 100B tokens).
+> **Engineering honesty upfront:** Every throughput, memory, convergence, and parity number in this writeup was measured directly on real NVIDIA B200 GPUs (no synthetic extrapolations or mocked timings).
+> - **Starting point:** Our correctness-verified `5b` Inkling looped MoE run (`5.403B` stored / `0.873B` active per pass / `48` layer-applications per token / `86.4 GB` FP32 master+grad+AdamW state) launched at **`1,412 tok/s/B200`** (`145.52 GB` peak VRAM → **\$78,691** at \$4/GPU-hr, crossing **\$100k+** at small batches or \$5–\$6/hr cloud rates).
+> - **Part 1 (`3,756 tok/s/B200`, \$29,582, 2.66x):** Tightened TE's `m_splits` padding alignment (`128 → 32`), replaced the `36 GB` FP32 `200k`-vocab logit materialization with checkpointed chunked cross-entropy (`0.0` loss diff, `-43.6 GB` VRAM), and derived exact `FlexAttention` online-softmax sink rescaling (`1e-6` IEEE FP32 parity) — enabling `bs=16x2048` and profiling the exact culprit holding utilization at `1.51%` MFU: TE `2.20.2`'s Python loop over 128 experts (`484,457` CUDA kernel launches and `312` `cudaStreamSynchronize` calls per step).
+> - **Part 2 (`21,719–23,175 tok/s/B200`, \$4,794–\$5,116, 15.4x–16.4x):** Replacing TE's loop with zero-sync unpadded `torch._grouped_mm` (`62.18 ms → 4.90 ms` MoE), writing a custom zero-atomic **Triton Flash-RPB+Sink** kernel (saving `12.6 MB` pre-projection features instead of `1.61 GB` `rel_logits`), eliminating transpose `.contiguous()` copies, rewriting depthwise `ShortConvolution` / `DynamicShortConvolution` and `BlockAttentionResidual` in contiguous `[B, T, C]` layouts, compiling chunked CE (`chunk=4096`), hoisting loop residual prep, and applying selective activation checkpointing (`gc_sac`) pushed single-GPU `5b` (`bs=32x2048`, `136.85 GB`) to **`23,175 tok/s/B200`** in BF16 (**\$4,794** / 100B tokens) and **`21,719 tok/s/B200`** with exact Four-Over-Six NVFP4 quantization (**\$5,116** / 100B tokens), plus **`41,510 tok/s` combined on `2x NVIDIA B200` NCCL DDP** (`97.4%` scaling efficiency) with `--resume`.
+> - **Why \$4.8k–\$5.1k isn't yet \$2k–\$4k (`30k–60k tok/s`):** We tested TE `2.20.2` (`NVTE_GROUPED_LINEAR_SINGLE_PARAM=1`), PyTorch `2.15` `F.scaled_grouped_mm`, and `torchao` `prototype.moe_training` live on B200. Both TE (`<= 64` tensors) and `torchao`'s SM100 padding kernel (`<= 32` groups) hard-fail on `E=128`, and PyTorch `2.15` has no hardware NVFP4 grouped GEMM kernel (`ValueError: No gemm implementation was found`). Closing the last `1.3x–1.5x` to **`< \$3,700`** waits on SM100 grouped FP4/FP8 kernels supporting `E >= 128` plus a CUTLASS FlashAttention-4 RPB+Sink backward kernel.
 
 ---
 
@@ -17,15 +19,18 @@ All measurements below were run on **NVIDIA B200 (`191.51 GB` HBM3e, compute cap
 - **Transformers:** `5.24.0`
 - **Target Model (`5b` preset):** `5.403 B` stored parameters, `8`-of-`128` routed experts (`hidden=1024`, `moe_intermediate_size=512`), `24` layers with layers `6..17` looped `3x` (`48` layer applications/token), `0.873 B` active per pass, `1.127 B` weights applied/token, `9.02e9` training FLOPs/token (with activation checkpointing `8 * applied`), `86.4 GB` training weight+grad+AdamW state before activations.
 
-| Configuration (`5b`, TE `tml` NVFP4/MXFP8) | Status | Tok/s per B200 | Peak VRAM | Effective TFLOPS (BF16 MFU vs 2.25 PF) | GPU-hours (100B tok) | Est. Cost @ \$4/GPU-hr (8 GPUs) |
+| Configuration (`5b`, FP32 master weights + AdamW) | Status | Tok/s per B200 | Peak VRAM | Effective TFLOPS (BF16 MFU vs 2.25 PF) | GPU-hours (100B tok) | Est. Cost @ \$4/GPU-hr (8 GPUs) |
 |---|---|---:|---:|---:|---:|---:|
-| Baseline (`bs=8x2048`, `align=32`, eager attn/CE) | **Measured** | `1,412` | `145.52 GB` | `12.74` (`0.57%`) | `19,673` | **\$78,691** (`102.5 d`) *(or \$100k+ @ small batch / \$5.50/hr)* |
+| Baseline (`te tml`, `bs=8x2048`, `align=32`, eager attn/CE) | **Measured** | `1,412` | `145.52 GB` | `12.74` (`0.57%`) | `19,673` | **\$78,691** (`102.5 d`) *(or \$100k+ @ small batch / \$5.50/hr)* |
 | + Chunked CE (`200k` vocab) & Fused ShortConv (`bs=8`) | **Measured** | `2,170` | `101.91 GB` | `19.57` (`0.87%`) | `12,801` | **\$51,203** (`66.7 d`) |
 | + CUDA `FlexAttention` w/ Sinks & RPB (`bs=8`) | **Measured** | `2,476` | `99.38 GB` | `22.33` (`0.99%`) | `11,219` | **\$44,875** (`58.4 d`) |
-| + Double Micro-batch (`bs=16x2048`, enabled by CE mem drop) | **Measured** | **`3,756`** | **`115.71 GB`** | **`33.88` (`1.51%`)** | **`7,396`** | **\$29,582** (`38.5 d`) |
-| Target Part 2: Fused Grouped NVFP4 + Epilogue Fusion | *Projected* | *30,000–60,000* | *< 130 GB* | *270.6–541.2 (`12.0%–24.1%`)* | *463–926* | ***\$1,852–\$3,704*** *(2.4–4.8 d)* |
+| + Double Micro-batch (`bs=16x2048`, Part 1 peak) | **Measured** | `3,756` | `115.71 GB` | `33.88` (`1.51%`) | `7,396` | **\$29,582** (`38.5 d`) |
+| + Zero-sync `torch._grouped_mm` BF16 + Compiled Layer & CE (`bs=16`, `gc_layer`) | **Measured** | `15,686` | `104.81 GB` | `141.49` (`6.29%`) | `1,771` | **\$7,083** (`9.2 d`) |
+| + **Triton Flash-RPB+Sink, Zero-Copy Convs/AttnRes, `gc_sac` (`bs=32`, exact 4/6 NVFP4)** | **Measured** | **`21,719`** | **`136.85 GB`** | **`195.91` (`8.71%`)** | **`1,279`** | **\$5,116** (`6.7 d`) |
+| + **Triton Flash-RPB+Sink, Zero-Copy Convs/AttnRes, `gc_sac` (`bs=32`, BF16 `quant="none"`)** | **Measured** | **`23,175`** | **`136.85 GB`** | **`209.04` (`9.29%`)** | **`1,199`** | **\$4,794** (`6.2 d`) |
+| Next Target: SM100 Hardware Grouped FP4/FP8 (`E >= 128`) + FA-4 RPB | *Projected* | *30,000–45,000* | *< 140 GB* | *270.6–405.9 (`12.0%–18.0%`)* | *617–926* | ***\$2,469–\$3,704*** *(3.2–4.8 d)* |
 
-*Notice the headroom:* hitting \$2k–\$4k per 100B tokens (`30k–60k tok/s/B200`) only requires **`12%–24%` BF16-equivalent MFU** (`3%–6%` of B200's 9 PF FP4 tensor core peak). The whole game is kernel fusion and eliminating host/Python launch overhead.
+*Note on `plan.py` FLOPs basis:* Effective TFLOPS above use `plan.py`'s `9.02e9` training FLOPs/token basis (`8x` applied weights assuming full layer recompute; actual FLOPs/token under `gc_sac` is slightly lower because Triton attention forward is saved rather than recomputed).
 
 ---
 
@@ -248,26 +253,119 @@ Before putting any serious cluster budget on `5b`, we also verified end-to-end d
 
 ---
 
-## 8. Part 2 Roadmap — Closing the Gap from \$29.6k (`3,756 tok/s`) to \$2k–\$4k (`30k–60k tok/s/B200`)
+## 8. Part 2: Profiling the 8,483 ms Step & Mapping Hardware 4-Bit / 8-Bit Grouped GEMM Reality on B200
 
-The arithmetic from `plan.py` is unforgiving and crystal clear: reaching **\$1,852–\$3,704** for a `100B`-token `5b` run (\$4/GPU-hr) means hitting **`30,000–60,000 tok/s/B200`** (`~271–541 TFLOPS` effective, `~12%–24%` of BF16 peak):
+With Part 1 at `3,756 tok/s/B200` (**\$29,582**), we profiled a full `bs=16x2048` step on B200 (`runs/b200-part2-probe.json`) before writing a single new kernel:
 
-1. **Replace TE's `CustomRecipe` `GroupedLinear` loop with fused grouped NVFP4 / MXFP8 GEMMs (Biggest lever — `5.5x+` on the dominant bottleneck):**
-   - *Quick diagnostic / BF16 baseline:* swap `GroupedLinear` to `torch._grouped_mm` (`9.01 ms` vs `49.93 ms`, **5.54x faster** on the MoE layer) inside `_experts_te` to confirm immediate end-to-end speedup before adding FP4 quantization kernels.
-   - *Target 4-bit kernel:* dispatch directly to Blackwell SM100 CUTLASS / cuBLASLt block-scaled `GroupedGEMM` (`NVFP4` forward without the `<= 64` expert RHT limit + `MXFP8` backward via TE's `general_grouped_gemm_for_grouped_tensor` or custom CUTLASS extensions using `single_grouped_weight=True`).
-2. **Fused Triton MoE epilogue & quantization (`softcap + SwiGLU + 4/6 NVFP4 quant` + CUDA routing):**
-   - Today `_experts_te` runs `softcap(gate) * sigmoid(gate) * softcap(up)` as ~7 separate memory-bound elementwise passes in FP32 between `gate_up` and `down`. Fusing `softcap + SiLU + Four-Over-Six NVFP4 activation quantization + padding scatter` into two Triton kernels removes multiple intermediate HBM round-trips per MoE layer.
-3. **Zero host-syncs & CUDA Graphs / regional `torch.compile`:**
-   - Eliminate `int(padded_counts.sum())` in `SparseMoeBlock._experts_te` (use fixed worst-case padded buffer capacity or asynchronous device-side offsets) so CUDA Graph capture or `torch.compile` runs zero-break across non-MoE blocks.
-4. **Selective activation checkpointing & scale:**
-   - Full-layer checkpointing increases compute from `6x` to `8x` applied weights per token (`6.76e9 → 9.02e9` FLOPs/token). With fused MoE + FlexAttention reducing activation footprints dramatically (`115.7 GB` at `bs=16`), checkpointing only dense/MoE sub-blocks selectively or using larger micro-batches recaptures another **1.25x–1.33x** throughput (and for `26B` `mini`, sharding optimizer/expert states via FSDP2 / Expert Parallelism instead of pure DDP).
+```text
+full_5b bs=16x2048 (te/tml, align=32): 8,483.1 ms/step (3,863 tok/s, 112.98 GB)
+  forward_ms     : 3,132.6 ms
+  backward_ms    : 5,304.8 ms
+  adamw_step_ms  :    44.2 ms  (standalone fused AdamW: 25.48 ms across 6,765 TE tensors vs 23.52 ms across 669 stacked tensors)
+  balance_step_ms:     1.5 ms
+  CPU/launch view: _GroupedLinear 3,920 ms self CPU (6,533 ms cum), 312x cudaStreamSynchronize (2,406 ms), 484,457 cudaLaunchKernel calls!
+```
+
+Optimizer step overhead wasn't the culprit (`44 ms` out of `8,483 ms`). Nearly everything was TE `_GroupedLinear` Python loop overhead (`312` host syncs, `484k` launches) plus uncompiled `1024`-token chunked CE (`346.75 ms` per step).
+
+### Testing Every Native SM100 Grouped FP4 / FP8 Path on B200
+We tested every Blackwell grouped quantization API shipped in NGC `26.10` (PyTorch `2.15`, TE `2.20.2`, `torchao`) on our `E=128` (`5b`) and `E=384` (`pretrain`) shapes (`runs/b200-fp4-gmm-probe.json`, `runs/b200-torchao-layer-probe.json`):
+
+1. **TE `2.20.2` with `NVTE_GROUPED_LINEAR_SINGLE_PARAM=1` (`single_grouped_weight=True, use_grouped_tensor=True`):**
+   - `BF16` works (`17.13 ms` single MoE vs `62.18 ms` `tml`).
+   - `MXFP8BlockScaling()` hard-fails: `group_quantize_mxfp8.cuh:1174: num_tensors <= 64` (got `128`).
+   - `NVFP4BlockScaling()` hard-fails: `graph_safe_group_row_cast_col_hadamard_transform_cast_fusion.cu:1385: num_tensors <= 64`.
+   - TE's internal `general_grouped_gemm_for_grouped_tensor` explicitly raises `NotImplementedError("Row-scaled NVFP4 GroupedTensor GEMM is not supported yet.")`.
+2. **`torchao.prototype.moe_training`:**
+   - `nvfp4_grouped_mm.py` is **emulated BF16 only** (`_emulated_nvfp4_scaled_grouped_mm_2d_3d` dequantizes to BF16 and calls `torch._grouped_mm`).
+   - `mxfp8_grouped_mm.py` has real SM100 hardware kernels, but enabling `pad_token_groups_for_grouped_mm=True` hits `mxfp8_extension.cpp:299: fused_pad_token_groups: num_groups must be <= 32, got: 128`.
+3. **PyTorch `2.15` `torch.nn.functional.scaled_grouped_mm` (raw 2-GEMM at `M=262,144, E=128, H=1024, inner=512`):**
+   - **MXFP8 (`ScalingType.BlockWise1x32`, `SWIZZLE_32_4_4`):** runs on SM100 tensor cores in **`0.52 ms` forward** (`3.17 GB`, `rel_l2 = 3.33e-6` vs dequantized BF16) — **`3.2x` faster** than `torch._grouped_mm` BF16 (`1.66 ms` fwd, `4.22 ms` fwd+bwd)!
+   - **NVFP4 (`ScalingType.BlockWise1x16`):** raises `ValueError('No gemm implementation was found')` across all tested swizzle/shape variants.
+
+**Takeaway:** Neither TE `2.20.2`, `torchao`, nor PyTorch `2.15` can execute hardware NVFP4 grouped GEMMs for `128` experts today. To get immediate `5x–6x` production speedups *while preserving exact Four-Over-Six NVFP4 training numerics and identical checkpoints*, we added `--backend grouped` in [loopfp4/inkling.py](../loopfp4/inkling.py): zero-sync `torch.argsort` + **unpadded `torch._grouped_mm` BF16** over `canonical_state_dict`-identical stacked weights, with optional exact Four-Over-Six NVFP4 straight-through quantization compiled right into Inductor!
 
 ---
 
-## 9. Reproducibility Appendix
+## 9. Zero-Sync `backend="grouped"` & Compiled Chunked CE (`3,756 → 15,686 tok/s`)
+
+1. **Unpadded zero-sync MoE dispatch (`SparseMoeBlock._experts_grouped`):**
+   - Replaces `int(padded_counts.sum())` (which broke `torch.compile` and forced host-device syncs) with `expert_i32 = expert.to(torch.int32)`, `torch.argsort(expert_i32, stable=False)`, `offs = counts.cumsum(0, dtype=torch.int32)`, unpadded `torch._grouped_mm`, and direct `torch.zeros(...).index_add_(0, token, y)`.
+   - When `quant="nvfp4"`, `quantize_act(flat, ...)` quantizes `[N, H]` **once per token before gathering** (`8x` less quantization work than quantizing `[N*top_k, H]`), with identical Four-Over-Six STE values and gradients.
+   - Verified on B200 even with half empty experts and odd/unaligned counts `[0, 1, 0, 3, 0, 7, 0, 17, 0, 33, 0, 2, 0, 5, 0, 11]` (`fwd_rel=4.42e-3`, `dx_rel=4.59e-3`, `dw1_rel=4.04e-3`, empty expert grad `0.0`) and full `SparseMoeBlock` parity vs `sim` (`quant="none"` `fwd=4.6e-5`, `quant="nvfp4"` `fwd=2.2e-5`).
+   - Compiled `5b` MoE (`bs=16x2048`): drops from `62.18 ms` (TE `tml`) to **`4.90 ms`** (`3.93 GB`)! Four-Over-Six quantization adds just `+1.27 ms/layer` (`+6.8%`) when compiled (`17.76 ms → 19.05 ms` SWA layer).
+2. **Compiled Chunked CE (`chunk = 4096` on CUDA):**
+   - Extracting `_ce_chunk_impl` cleanly behind `@torch.compile` and bumping `chunk` from `1024 → 4096` cut `200k`-vocab cross-entropy (`32,768` tokens) from **`346.75 ms → 97.59 ms` (`3.55x` faster)** at just `5.70 GB` peak VRAM.
+3. **Per-layer compilation (`layer.compile()`):**
+   - Compiling each of the 24 `DecoderLayer` instances (`layer.compile()` in [train.py](../train.py)) gives clean TorchInductor fusion across `48` layer calls without unrolling a 48-layer giant graph — immediately lifting `5b` with FP32 master weights to **`15,686 tok/s/B200`** (**`4.18x`** over Part 1, **\$7,083**/100B tokens)!
+
+---
+
+## 10. Why Attention + ShortConv Cost 3x More Than MoE — and How We Fixed Both
+
+Once MoE dropped to `~5 ms/layer`, profiling a compiled SWA layer (`23.89 ms`) and Global layer (`28.68 ms`) revealed an ironic inversion (`runs/b200-torchao-layer-probe.json`):
+
+```text
+Compiled ZeroSyncGroupedMMMoE alone (bs=16x2048)        :  5.56 ms
+Compiled SWA Attention + Convs + Residuals ONLY (no MLP): 16.81 ms  (3.0x SLOWER than MoE!)
+```
+
+Three hidden kernels explained why:
+1. **`FlexAttention` backward + `rel_logits` atomics (`6.41 ms` SWA / `8.64 ms` Global):** Capturing a 4D `[16, 12, 2048, 1024]` `rel_logits` tensor (`805 MB` BF16 / `1.61 GB` FP32) inside `score_mod` forces `flex_attention_backward` to scatter into `d_rel_logits` via `tl.atomic_add` inside its inner K-loop (`1.04 ms fwd → 6.41 ms bwd`, **`6.2x`** backward asymmetry!).
+2. **`ShortConvolution` `F.conv1d(..., groups=dim)` under `torch.compile` (`~3.0 ms/SWA layer`):** Replacing the slice loop with `F.conv1d` helped eager mode in Part 1, but Inductor lowers depthwise `conv1d` to opaque `aten::_conv_depthwise2d` + `[B, T, C] ↔ [B, C, T]` transposes across 4 convs per SWA layer. Meanwhile `DynamicShortConvolution` used `unfold(-1, K, 1)` to materialize `[16, 2048, 1024, 4]` windows (`~4 ms` on Global layers).
+3. **`BlockAttentionResidual.mix` `aten::bmm` (`1.12 ms` SWA / `4.18 ms` Global):** `attn @ states` invoked Tensor Core `bmm` on tiny `[1..3, 1..5] × [1..5, 1024]` slices (`cutlass_80_wmma` `16x16` padding waste). Plus `Inkling.forward` called `MessageAttentionResidual` 12 times per loop pass (`24x` total) on the same `(prev_blocks, prev_hidden)`.
+
+### Fixes Implemented
+- **Custom Triton Flash-RPB+Sink Attention ([loopfp4/triton_attn.py](../loopfp4/triton_attn.py)):**
+  - Because `d = q_idx - k_idx` is **strictly 1-to-1 per query row**, splitting backward into K/V-parallel `_rpb_sink_bwd_dkdv_kernel` (`zero atomics`) + Q-parallel `_rpb_sink_bwd_dq_drpb_kernel` replaces every `tl.atomic_add` with plain coalesced stores into `d_rel_logits`, while forwarding skips saving `rel_logits` completely (`12.6 MB` `rel` instead of `1.61 GB`!).
+  - Accepts non-contiguous `.transpose(1, 2)` inputs (`q, k, v, rel, sinks`) directly via strides — **zero `.contiguous()` transpose copies**, avoiding the `17` copies (`1.31 ms/layer`) we hit on our first draft! *(Tile-tuning lesson on B200: bumping forward to `BM=128, num_stages=3` spilled registers/SMEM and regressed fwd to `4.00 ms`, whereas `(BM=64, BN=64, num_warps=4, num_stages=2)` achieved **`3.44 ms`** kernel time cleanly!)*
+  - **Exactness verified on B200 (`runs/b200-part2-verify-report.json`):** Matches eager FP32 IEEE across SWA `T=2048`, Global `T=2048`, `smoke` (`D=32, T=256`), and non-multiple `T=300` to **`fwd_rel_l2 <= 5e-7`** and **all 6 gradients (`q, k, v, rel, proj, sinks`) `<= 1.8e-6`** (`BF16 <= 2.93e-3`). At `bs=16x2048`: SWA `10.08 ms (3.90 GB) → 8.28 ms (2.21 GB)` (`1.22x`), Global `14.86 ms → 9.12 ms` (`1.63x`).
+- **Contiguous Convs, Fused AttnRes, & Hoisted Loop Messages ([loopfp4/inkling.py](../loopfp4/inkling.py)):**
+  - Rewrote `ShortConvolution` and `DynamicShortConvolution` as native contiguous `[B, T, C]` 4-tap shift-sums that Inductor fuses into single pointwise kernels (verified `atol=1e-5` exact forward + grads in `test_fast_convs_and_attn_res_exact`).
+  - Replaced `attn @ states` in `BlockAttentionResidual` with fused elementwise reductions (`zero bmm`), and hoisted `MessageAttentionResidual.prepare_states(...)` to run once per loop pass (`2x` instead of `24x`).
+  - Result: Compiled uncheckpointed `5b` layer latency dropped from **`23.89 ms → 17.76 ms`** (`SWA`) and **`28.68 ms → 19.87 ms`** (`Global`)!
+
+---
+
+## 11. Selective Activation Checkpointing (`gc_sac`), `bs=32` Scaling, & `2x B200` DDP + `--resume`
+
+Full-layer checkpointing (`gc_layer`) left `~66 GB` of B200's `178.36 GiB` usable HBM unused (`112.08 GB` at `bs=16`) while paying recomputation on all 48 passes (`1,760 ms/step`). Simply disabling layer checkpointing on MLP-only (`gc_mlp`) OOM'd at `171.7 / 178.4 GiB` (`48` passes of uncheckpointed FP32 conv/residual intermediates cost `~85 GB`), and `gc_half` peaked near the limit (`173.9 GB`, `20,667 tok/s`).
+
+Adding **Selective Activation Checkpointing (`--grad-checkpoint-mode sac`)** — saving `rpb_sink_attn_fwd` and dense `aten.mm` while recomputing only cheap elementwise/conv ops and MoE — unlocked the memory/compute sweet spot (`runs/b200-part2-verify-report.json`):
+
+| `5b` Configuration (`backend="grouped"`, `layer.compile()`, FP32 master weights) | Tok/s / B200 | Step Time | Peak VRAM | Cost / 100B @ \$4/hr |
+|---|---:|---:|---:|---:|
+| `bs=16`, `bf16`, `gc_layer` | `18,617` | `1,760.1 ms` | `112.08 GB` | **\$5,968** |
+| `bs=16`, `nvfp4`, `gc_layer` | `17,523` | `1,870.0 ms` | `112.08 GB` | **\$6,341** |
+| `bs=16`, `bf16`, `gc_half` | `20,667` | `1,585.5 ms` | `173.85 GB` | **\$5,376** |
+| `bs=16`, `nvfp4`, `gc_sac` (`fwd 513ms`, `bwd 1047ms`, `clip 10ms`, `opt 24ms`, `bal 3ms`) | `20,502` | `1,598.3 ms` | `104.19 GB` | **\$5,420** |
+| `bs=16`, `bf16`, `gc_sac` (`fwd 455ms`, `bwd 993ms`, `clip 10ms`, `opt 24ms`, `bal 3ms`) | `22,056` | `1,485.7 ms` | `104.19 GB` | **\$5,038** |
+| `bs=24`, `nvfp4`, `gc_sac` | `21,309` | `2,306.6 ms` | `120.51 GB` | **\$5,214** |
+| `bs=24`, `bf16`, `gc_sac` | `22,800` | `2,155.8 ms` | `120.51 GB` | **\$4,873** |
+| **`bs=32`, `nvfp4` (exact 4/6), `gc_sac`** | **`21,719`** | **`3,017.5 ms`** | **`136.85 GB`** | **\$5,116** |
+| **`bs=32`, `bf16` (`quant="none"`), `gc_sac`** | **`23,175`** | **`2,827.9 ms`** | **`136.85 GB`** | **\$4,794** |
+
+### Two-GPU `2x NVIDIA B200` NCCL DDP War Story & Verified Resume
+Combining `layer.compile()`, `DDP`, and `SAC` on `2x B200` immediately hit a PyTorch `2.15` compiler bug: `DDPOptimizer` splits each compiled layer FX subgraph into multiple submodules across parameter buckets (`down_proj`), stripping `meta["ac_graph_id"]` and crashing in `cleanup_recompute_tags` with `TypeError: '>' not supported between instances of 'NoneType' and 'NoneType'`.
+
+Because `train.py` already compiles per-layer across `48` layer calls, setting `torch._dynamo.config.optimize_ddp = False` in [train.py](../train.py) when `args.compile and ink and ddp` keeps full inter-layer NCCL backward overlap while running cleanly under `DDP + SAC`. Verified end-to-end on **`2x NVIDIA B200`** (`--preset 5b --backend grouped --quant nvfp4 --grad-checkpoint-mode sac --compile --batch-size 24`):
+- **Steps `1..4` + checkpoint save:** steady-state **`41,420–41,510 tok/s` combined** (`97.4%` scaling efficiency vs `21,309 tok/s` single-GPU at `bs=24`), `idle_experts = 0`, `exit=0`.
+- **Resumed steps `5..8` (`--resume`):** `resumed from step 4`, **`41,473–41,508 tok/s` combined**, `load_max` tightened `1.70 → 1.32`, loop gates opened (`1e-5 → 0.00011`), `exit=0`.
+
+---
+
+## 12. Closing the Last `1.3x–1.5x` to \$2k–\$4k (`30k–45k tok/s`)
+
+From our final `bs=16` SWA profiler (`17.76 ms` BF16 / `19.05 ms` NVFP4) and phase breakdown (`455 ms` fwd / `993 ms` bwd), two concrete hardware/kernel items separate **\$4,794–\$5,116** (`21.7k–23.2k tok/s`) from **\$2,469–\$3,704** (`30k–45k tok/s`):
+1. **Warp-Specialized / TMA FlashAttention-4 RPB+Sink:** Triton `rpb_sink_attn` currently accounts for `3.54 ms fwd + 4.84 ms bwd = 8.38 ms` — **`47%` of the entire compiled SWA layer** — largely due to `805 MB` `rel_logits`/`d_rel_logits` materialization (`~1.15 ms`) and lack of SM100 UMMA/TMA warp specialization compared to `FlexAttention` fwd (`1.92 ms`). Cutting attention fwd+bwd from `~8.4 ms → ~3.5–4.0 ms` saves **`~235 ms/step`** at `bs=16`.
+2. **SM100 Native Grouped NVFP4/MXFP8 GEMMs for `E >= 128`:** Bypassing the `<= 32` / `<= 64` tensor-list caps lets `F.scaled_grouped_mm` (`0.52 ms` raw 2-GEMM MXFP8 vs `1.66 ms` BF16) and SM100 NVFP4 tensor cores eliminate both the `+1.27 ms/layer` Four-Over-Six emulation tax and `2x–3x` of grouped GEMM compute/bandwidth.
+
+---
+
+## 13. Reproducibility Appendix
 
 ```bash
-# 1. Local unit tests (9 core + 16 inkling tests, zero network/GPU needed)
+# 1. Local unit tests (9 core + 19 inkling tests, zero network/GPU needed)
 python3 tests/test_core.py && python3 tests/test_inkling.py
 
 # 2. Live Hugging Face FineWeb-Edu + Inkling-2-Mini tokenizer data prep
@@ -276,13 +374,14 @@ python3 prepare_data.py \
     --tokenizer hf:thinkingmachines/Inkling-2-Mini \
     --out /tmp/fineweb-check --max-tokens 1e6
 
-# 3. Initial B200 verification, alignment sweep & recipe checks (~$0.28 on Modal)
+# 3. Part 1 B200 baseline, alignment sweep, exactness & TE 2x DDP
 modal run modal_verify_b200.py
-
-# 4. Exactness (IEEE FP32 + BF16 + 200k CE), single-layer + full 5B benchmarks, and 2x B200 DDP
 modal run modal_verify_ddp_and_perf.py
 
+# 4. Part 2 B200 Triton attention exactness, unpadded grouped parity, 5B throughput & 2x DDP
+modal run modal_verify_part2.py
+
 # 5. Recompute 100B-token cost table at any measured throughput
-python3 plan.py --preset 5b --gpus 8 --tokens 100e9 --tok-per-s-per-gpu 3756
-python3 plan.py --preset 5b --gpus 8 --tokens 100e9 --tok-per-s-per-gpu 30000
+python3 plan.py --preset 5b --gpus 8 --tokens 100e9 --tok-per-s-per-gpu 21719
+python3 plan.py --preset 5b --gpus 8 --tokens 100e9 --tok-per-s-per-gpu 23175
 ```
